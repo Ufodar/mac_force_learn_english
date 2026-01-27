@@ -1,0 +1,7 @@
+# One line per sentence.
+# Optional: add translation/notes after a TAB or "||"
+
+Consistency beats intensity.	持续胜过爆发。
+Read the error message carefully.	仔细读报错信息。
+Make it work, then make it right, then make it fast.	先让它能跑，再让它正确，最后再优化性能。
+
