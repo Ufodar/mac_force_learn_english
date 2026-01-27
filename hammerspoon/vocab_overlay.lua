@@ -1012,13 +1012,26 @@ local function buildCanvasForScreen(screen)
   local canvas = hs.canvas.new(frame)
 
   canvas:level("screenSaver")
-  canvas:behavior({
-    "canJoinAllSpaces",
-    "moveToActiveSpace",
-    "transient",
-    "fullScreenAuxiliary", -- ignored if unavailable
-    "ignoresCycle",        -- ignored if unavailable
-  })
+  -- macOS: canJoinAllSpaces and moveToActiveSpace are mutually exclusive.
+  -- Prefer joining all spaces; fall back to moveToActiveSpace if needed.
+  local ok = pcall(function()
+    canvas:behavior({
+      "canJoinAllSpaces",
+      "transient",
+      "fullScreenAuxiliary", -- ignored if unavailable
+      "ignoresCycle",        -- ignored if unavailable
+    })
+  end)
+  if not ok then
+    pcall(function()
+      canvas:behavior({
+        "moveToActiveSpace",
+        "transient",
+        "fullScreenAuxiliary",
+        "ignoresCycle",
+      })
+    end)
+  end
 
   local cardW = math.min(config.ui.cardMaxWidth, frame.w * 0.82)
   local cardH = math.min(config.ui.cardMaxHeight, frame.h * 0.50)
