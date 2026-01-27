@@ -61,6 +61,5 @@ Installed:
 Next:
   1) Open Hammerspoon, grant Accessibility permission if prompted.
   2) Click Hammerspoon -> Reload Config
-  3) In menu bar "EN" -> Settings… to configure your LLM.
+  3) In menu bar "VO" -> Settings… to configure your LLM.
 EOF
-
