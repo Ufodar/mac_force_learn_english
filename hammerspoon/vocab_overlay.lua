@@ -39,10 +39,15 @@ local config = {
   -- Expected response (recommended): { "item": { "type": "word|sentence", "front": "...", "back": "..." } }
   llm = {
     enabled = false,
+    protocol = "simple", -- "simple" (custom endpoint) | "openai" (OpenAI-compatible /v1/chat/completions)
     mode = "enrich", -- "enrich" (fill back for a picked item) | "generate" (ask LLM for a new item)
     endpoint = "",
+    model = "", -- required when protocol == "openai"
     apiKey = "", -- optional (sent as `Authorization: Bearer ...`)
+    apiKeyEnv = "OPENAI_API_KEY",
     timeoutSeconds = 8,
+    temperature = 0.2,
+    maxTokens = 280,
     extraHeaders = {},
     preferences = {
       language = "zh",
@@ -656,10 +661,17 @@ function M.toggleBack()
 end
 
 local function llmEnabled()
-  return config.llm
-    and config.llm.enabled
-    and type(config.llm.endpoint) == "string"
-    and config.llm.endpoint ~= ""
+  if not (config.llm and config.llm.enabled) then
+    return false
+  end
+  if type(config.llm.endpoint) ~= "string" or config.llm.endpoint == "" then
+    return false
+  end
+  local protocol = config.llm.protocol or "simple"
+  if protocol == "openai" and (type(config.llm.model) ~= "string" or config.llm.model == "") then
+    return false
+  end
+  return true
 end
 
 local function collectCategoryIds()
@@ -674,6 +686,20 @@ local function collectCategoryIds()
     end
   end
   return ids
+end
+
+local function collectCategoriesWithWeights()
+  local out = {}
+  local cats = config.sources and config.sources.wordlists and config.sources.wordlists.categories
+  if type(cats) ~= "table" then
+    return out
+  end
+  for _, cat in ipairs(cats) do
+    if type(cat.id) == "string" and cat.id ~= "" then
+      table.insert(out, { id = cat.id, weight = tonumber(cat.weight) or 1 })
+    end
+  end
+  return out
 end
 
 local function normalizeItem(raw)
@@ -720,10 +746,25 @@ local function parseItemFromResponseBody(body)
     return nil
   end
 
-  local candidate = data.item
-  if not candidate and type(data.items) == "table" then
-    candidate = data.items[1]
+  local candidate = nil
+  if type(data) == "table" then
+    if data.item ~= nil then
+      candidate = data.item
+    elseif type(data.items) == "table" and data.items[1] ~= nil then
+      candidate = data.items[1]
+    end
   end
+
+  -- OpenAI-compatible: parse from choices[1].message.content / choices[1].text
+  if not candidate and type(data) == "table" and type(data.choices) == "table" and type(data.choices[1]) == "table" then
+    local content = (data.choices[1].message and data.choices[1].message.content) or data.choices[1].text
+    local extracted = extractFirstJson(content or "")
+    local decoded = decodeJsonMaybe(extracted or "")
+    if decoded then
+      candidate = decoded.item or (type(decoded.items) == "table" and decoded.items[1]) or decoded
+    end
+  end
+
   if not candidate then
     candidate = data
   end
@@ -735,19 +776,29 @@ local function parseItemFromResponseBody(body)
     end
   end
 
-  if type(candidate) ~= "table" and type(data.choices) == "table" and type(data.choices[1]) == "table" then
+  if type(candidate) ~= "table" then
+    return nil
+  end
+
+  local item = normalizeItem(candidate)
+  if item then
+    return item
+  end
+
+  -- If we accidentally normalized the whole OpenAI response table, try choices as fallback.
+  if type(data) == "table" and type(data.choices) == "table" and type(data.choices[1]) == "table" then
     local content = (data.choices[1].message and data.choices[1].message.content) or data.choices[1].text
     local extracted = extractFirstJson(content or "")
     local decoded = decodeJsonMaybe(extracted or "")
     if decoded then
-      candidate = decoded.item or (type(decoded.items) == "table" and decoded.items[1]) or decoded
+      local cand2 = decoded.item or (type(decoded.items) == "table" and decoded.items[1]) or decoded
+      if type(cand2) == "table" then
+        return normalizeItem(cand2)
+      end
     end
   end
 
-  if type(candidate) ~= "table" then
-    return nil
-  end
-  return normalizeItem(candidate)
+  return nil
 end
 
 local function buildLlmHeaders()
@@ -755,13 +806,23 @@ local function buildLlmHeaders()
   for k, v in pairs(config.llm.extraHeaders or {}) do
     headers[k] = v
   end
+
+  local apiKey = ""
   if type(config.llm.apiKey) == "string" and config.llm.apiKey ~= "" then
-    headers["Authorization"] = "Bearer " .. config.llm.apiKey
+    apiKey = config.llm.apiKey
+  else
+    local envName = (type(config.llm.apiKeyEnv) == "string") and config.llm.apiKeyEnv or ""
+    if envName ~= "" then
+      apiKey = os.getenv(envName) or ""
+    end
+  end
+  if apiKey ~= "" then
+    headers["Authorization"] = "Bearer " .. apiKey
   end
   return headers
 end
 
-local function buildLlmPayload(baseItem)
+local function buildSimplePayload(baseItem)
   local mode = config.llm.mode or "enrich"
   local payload = {
     mode = mode,
@@ -775,7 +836,82 @@ local function buildLlmPayload(baseItem)
   return payload
 end
 
-local function llmRequest(payload, callback)
+local function buildOpenAiMessages(baseItem)
+  local prefs = config.llm.preferences or {}
+  local language = (type(prefs.language) == "string" and prefs.language ~= "") and prefs.language or "zh"
+  local style = (type(prefs.style) == "string" and prefs.style ~= "") and prefs.style or "concise"
+  local includeExample = prefs.includeExample ~= false
+
+  local mode = config.llm.mode or "enrich"
+
+  local systemPrompt = table.concat({
+    "You are a language tutor helping a Chinese learner memorize English words and sentences.",
+    "Return STRICT JSON only. No markdown. No extra text.",
+    'Your JSON must be an object with key "item".',
+    'Schema: {"item":{"type":"word|sentence","front":"...","back":"...","meta":{...}}}',
+    'The "front" must be English. The "back" must be in ' .. language .. ".",
+    'Keep it ' .. style .. " and easy to review quickly.",
+    includeExample and 'If possible, include 1 short example sentence and its ' .. language .. " translation in back." or "No example sentence is required.",
+  }, "\n")
+
+  local userPrompt
+  if mode == "generate" then
+    local categories = collectCategoriesWithWeights()
+    userPrompt = table.concat({
+      "Generate ONE item for spaced repetition.",
+      "Prefer producing a WORD (not a sentence), unless a sentence is clearly better.",
+      "Choose exactly one category from the list below, and put it into item.meta.category.",
+      "Categories (id, weight): " .. (json.encode(categories) or "[]"),
+      "",
+      'Output JSON only. Example:',
+      '{"item":{"type":"word","front":"algorithm","back":"算法；…\\nExample: ...\\n译: ...","meta":{"category":"cs"}}}',
+    }, "\n")
+  else
+    local input = {
+      type = baseItem and baseItem.type or "word",
+      front = baseItem and baseItem.front or "",
+      back = baseItem and baseItem.back or "",
+      meta = baseItem and baseItem.meta or nil,
+    }
+    userPrompt = table.concat({
+      "Enrich the following item for quick memorization.",
+      'Keep item.front unchanged. Put meaning/notes into item.back.',
+      "Input: " .. (json.encode(input) or "{}"),
+      "",
+      'Output JSON only. Example:',
+      '{"item":{"type":"word","front":"algorithm","back":"算法；…\\nExample: ...\\n译: ...","meta":{"category":"cs"}}}',
+    }, "\n")
+  end
+
+  return {
+    { role = "system", content = systemPrompt },
+    { role = "user", content = userPrompt },
+  }
+end
+
+local function buildOpenAiRequest(baseItem)
+  local req = {
+    model = config.llm.model,
+    messages = buildOpenAiMessages(baseItem),
+    temperature = tonumber(config.llm.temperature) or 0.2,
+  }
+  local maxTokens = tonumber(config.llm.maxTokens)
+  if maxTokens and maxTokens > 0 then
+    req.max_tokens = math.floor(maxTokens)
+  end
+  return req
+end
+
+local function buildLlmRequest(baseItem)
+  local protocol = config.llm.protocol or "simple"
+  if protocol == "openai" then
+    return buildOpenAiRequest(baseItem)
+  end
+  return buildSimplePayload(baseItem)
+end
+
+local function llmRequest(baseItem, callback)
+  local payload = buildLlmRequest(baseItem)
   local body = json.encode(payload) or "{}"
   http.doAsyncRequest(config.llm.endpoint, "POST", body, buildLlmHeaders(), function(code, respBody)
     callback(code, respBody)
@@ -783,13 +919,16 @@ local function llmRequest(payload, callback)
 end
 
 function M.showNext()
+  local mode = config.llm.mode or "enrich"
+  local useLlm = llmEnabled()
+
   local baseItem = pickNextItem()
-  if not baseItem then
-    hs.alert.show("vocab_overlay: 没有可用条目（检查 data/items.json / sentences.txt / wordlists/*.txt）")
+  if not baseItem and not (useLlm and mode == "generate") then
+    hs.alert.show("vocab_overlay: 没有可用条目（检查 data/items.json / sentences.txt / wordlists/*.txt，或开启 llm.generate）")
     return
   end
 
-  if not llmEnabled() then
+  if not useLlm then
     M.show(baseItem)
     return
   end
@@ -797,7 +936,6 @@ function M.showNext()
   cancelPending()
   state.loading = true
 
-  local mode = config.llm.mode or "enrich"
   local timeoutSeconds = tonumber(config.llm.timeoutSeconds) or 8
   local requestId = (state.pending and state.pending.id or 0) + 1
   state.pending = { id = requestId }
@@ -846,8 +984,7 @@ function M.showNext()
     finalize(fallbackItem)
   end)
 
-  local payload = buildLlmPayload(baseItem)
-  llmRequest(payload, function(code, body)
+  llmRequest(baseItem, function(code, body)
     if not state.pending or state.pending.id ~= requestId then
       return
     end

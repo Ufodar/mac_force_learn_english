@@ -37,6 +37,8 @@ require("vocab_overlay").start()
 
 权重在 `~/.hammerspoon/vocab_overlay.lua` 的 `config.sources.wordlists.categories` 里调。
 
+如果你暂时没有这些词表，可以直接开启 **大模型生成模式**（见下方 3.5），不需要任何本地词库文件。
+
 ### B. 句子
 
 编辑：`~/.hammerspoon/data/sentences.txt`（一行一句；可选加翻译：`英文<TAB>中文`）
@@ -61,19 +63,26 @@ require("vocab_overlay").start()
 ```lua
 llm = {
   enabled = true,
-  mode = "enrich", -- enrich: 给选中的词/句补全 back；generate: 让模型直接生成新条目
-  endpoint = "http://127.0.0.1:3000/vocab",
-  apiKey = "",
+  protocol = "openai",  -- openai: 兼容 /v1/chat/completions；simple: 自己写一个 /vocab 接口
+  mode = "generate",    -- generate: 不依赖本地词库，直接让模型生成；enrich: 给选中的词/句补全 back
+  endpoint = "http://127.0.0.1:1234/v1/chat/completions",
+  model = "your-model-name",
+  apiKey = "",          -- 可留空，走环境变量 OPENAI_API_KEY
 }
 ```
 
-推荐你的接口返回：
+### `protocol = "openai"`（推荐）
+
+不需要写后端，只要你的服务兼容 `POST /v1/chat/completions`（例如本地/自建的 OpenAI-compatible 服务）。
+脚本会要求模型 **直接输出 JSON**（在 `message.content` 里），格式示例：
 
 ```json
-{ "item": { "type": "word", "front": "algorithm", "back": "算法；…\\n例句：…" } }
+{ "item": { "type": "word", "front": "algorithm", "back": "算法；…\\nExample: ...\\n译: ...", "meta": { "category": "cs" } } }
 ```
 
-脚本发出的请求（示意）：
+### `protocol = "simple"`（你想自定义接口时）
+
+你也可以自己写一个接口，例如 `endpoint = "http://127.0.0.1:3000/vocab"`，脚本发出的请求（示意）：
 
 ```json
 { "mode": "enrich", "item": { "type": "word", "front": "algorithm", "meta": { "category": "cs" } }, "preferences": { "language": "zh" } }
@@ -102,4 +111,4 @@ llm = {
 - `showBackByDefault`：是否默认显示 back
 - `autoStart`：是否启动就开始定时弹出
 - `sources.wordsWeight / sentencesWeight / itemsWeight`：三类来源的权重
-- `llm.enabled / llm.mode / llm.endpoint / llm.timeoutSeconds`：大模型接入开关与超时
+- `llm.enabled / llm.protocol / llm.mode / llm.endpoint / llm.model / llm.timeoutSeconds`：大模型接入与超时
