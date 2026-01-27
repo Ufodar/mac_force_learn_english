@@ -398,7 +398,7 @@ local function sanitizeMeta(meta)
   end
   local out = {}
   for k, v in pairs(meta) do
-    if k ~= "phase" and k ~= "_phase" and k ~= "_transient" then
+    if k ~= "phase" and k ~= "_phase" and k ~= "_transient" and k ~= "reviewCount" then
       out[k] = v
     end
   end
