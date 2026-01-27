@@ -80,6 +80,8 @@ llm = {
 { "item": { "type": "word", "front": "algorithm", "back": "算法；…\\nExample: ...\\n译: ...", "meta": { "category": "cs" } } }
 ```
 
+生成出来的内容会自动保存到：`~/.hammerspoon/data/generated_store.json`，并且会按 `newWordsBeforeReview` 规则穿插复习旧词（默认每 3 个新词插入 1 个旧词复习，可在 `config.llm.generate` 里改）。
+
 ### `protocol = "simple"`（你想自定义接口时）
 
 你也可以自己写一个接口，例如 `endpoint = "http://127.0.0.1:3000/vocab"`，脚本发出的请求（示意）：
@@ -112,3 +114,5 @@ llm = {
 - `autoStart`：是否启动就开始定时弹出
 - `sources.wordsWeight / sentencesWeight / itemsWeight`：三类来源的权重
 - `llm.enabled / llm.protocol / llm.mode / llm.endpoint / llm.model / llm.timeoutSeconds`：大模型接入与超时
+- `llm.generate.newWordsBeforeReview`：每 N 个新词插入 1 个旧词复习
+- `storage.storeFile`：生成/复习记录保存位置

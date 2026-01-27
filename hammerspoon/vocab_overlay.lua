@@ -7,6 +7,7 @@ end
 
 local json = require("hs.json")
 local http = require("hs.http")
+local fs = require("hs.fs")
 
 local config = {
   intervalSeconds = 20 * 60, -- every 20 minutes
@@ -40,7 +41,7 @@ local config = {
   llm = {
     enabled = false,
     protocol = "simple", -- "simple" (custom endpoint) | "openai" (OpenAI-compatible /v1/chat/completions)
-    mode = "enrich", -- "enrich" (fill back for a picked item) | "generate" (ask LLM for a new item)
+    mode = "generate", -- "generate" (ask LLM for a new item) | "enrich" (fill back for a picked item)
     endpoint = "",
     model = "", -- required when protocol == "openai"
     apiKey = "", -- optional (sent as `Authorization: Bearer ...`)
@@ -48,12 +49,24 @@ local config = {
     timeoutSeconds = 8,
     temperature = 0.2,
     maxTokens = 280,
+    generate = {
+      wordWeight = 6,
+      sentenceWeight = 2,
+      newWordsBeforeReview = 3, -- after N new words, show 1 review word
+      avoidListSize = 40,
+      maxRetries = 6,
+    },
     extraHeaders = {},
     preferences = {
       language = "zh",
       style = "concise",
       includeExample = true,
     },
+  },
+
+  storage = {
+    storeFile = hs.configdir .. "/data/generated_store.json",
+    saveDebounceSeconds = 0.4,
   },
 
   hotkeys = {
@@ -94,6 +107,9 @@ local state = {
   items = nil,
   sentences = nil,
   wordlists = nil,
+  store = nil,
+  storeIndex = nil,
+  storeSaveTimer = nil,
   canvases = {},
   visible = false,
   backRevealed = false,
@@ -106,6 +122,7 @@ local state = {
   screenWatcher = nil,
 
   lastKey = hs.settings.get("vocabOverlay.lastKey") or nil,
+  newWordStreak = hs.settings.get("vocabOverlay.newWordStreak") or 0,
   needsRebuild = true,
 
   modal = nil,
@@ -124,6 +141,37 @@ local function readFile(path)
   local content = f:read("*a")
   f:close()
   return content
+end
+
+local function writeFile(path, content)
+  local f, err = io.open(path, "w")
+  if not f then
+    return nil, err
+  end
+  f:write(content or "")
+  f:close()
+  return true
+end
+
+local function ensureDir(path)
+  local attr = fs.attributes(path)
+  if attr and attr.mode == "directory" then
+    return true
+  end
+  local ok, err = fs.mkdir(path)
+  if ok then
+    return true
+  end
+  -- If it already exists, that's fine.
+  local attr2 = fs.attributes(path)
+  if attr2 and attr2.mode == "directory" then
+    return true
+  end
+  return nil, err
+end
+
+local function nowSeconds()
+  return os.time()
 end
 
 local function trim(s)
@@ -321,7 +369,8 @@ end
 local function itemKey(item)
   local t = (type(item) == "table" and item.type) or "text"
   local front = (type(item) == "table" and item.front) or ""
-  return tostring(t) .. ":" .. tostring(front)
+  front = trim(tostring(front)):gsub("%s+", " ")
+  return (tostring(t) .. ":" .. front):lower()
 end
 
 local function cloneItem(item)
@@ -341,6 +390,243 @@ local function cloneItem(item)
     back = item.back,
     meta = meta,
   }
+end
+
+local function sanitizeMeta(meta)
+  if type(meta) ~= "table" then
+    return nil
+  end
+  local out = {}
+  for k, v in pairs(meta) do
+    if k ~= "phase" and k ~= "_phase" and k ~= "_transient" then
+      out[k] = v
+    end
+  end
+  return out
+end
+
+local function ensureStoreLoaded()
+  if state.store and state.storeIndex then
+    return
+  end
+
+  ensureDir(hs.configdir .. "/data")
+
+  local path = config.storage.storeFile
+  local content = readFile(path)
+  local decoded = nil
+  if content and content ~= "" then
+    local ok, data = pcall(json.decode, content)
+    if ok and type(data) == "table" then
+      decoded = data
+    end
+  end
+
+  local store = { version = 1, items = {} }
+  if decoded and type(decoded.items) == "table" then
+    store.version = tonumber(decoded.version) or 1
+    store.items = decoded.items
+  end
+
+  local items = {}
+  local index = {}
+  for _, raw in ipairs(store.items or {}) do
+    if type(raw) == "table" then
+      local front = raw.front or raw.q or raw.word or raw.sentence or raw[1]
+      local back = raw.back or raw.a or raw.meaning or raw.translation or raw[2]
+      if type(front) == "string" and front ~= "" then
+        local rec = {
+          type = raw.type or "text",
+          front = front,
+          back = (type(back) == "string") and back or "",
+          meta = (type(raw.meta) == "table") and raw.meta or nil,
+          createdAt = tonumber(raw.createdAt) or 0,
+          seenCount = tonumber(raw.seenCount) or 0,
+          lastSeenAt = tonumber(raw.lastSeenAt) or 0,
+        }
+        if rec.createdAt <= 0 then
+          rec.createdAt = nowSeconds()
+        end
+        local key = itemKey(rec)
+        local existing = index[key]
+        if existing then
+          if (type(existing.back) ~= "string" or existing.back == "") and type(rec.back) == "string" then
+            existing.back = rec.back
+          end
+          existing.seenCount = math.max(existing.seenCount or 0, rec.seenCount or 0)
+          existing.lastSeenAt = math.max(existing.lastSeenAt or 0, rec.lastSeenAt or 0)
+          existing.createdAt = math.min(existing.createdAt or rec.createdAt, rec.createdAt)
+          existing.meta = existing.meta or rec.meta
+        else
+          index[key] = rec
+          table.insert(items, rec)
+        end
+      end
+    end
+  end
+
+  state.store = { version = store.version or 1, items = items }
+  state.storeIndex = index
+end
+
+local function saveStoreNow()
+  ensureStoreLoaded()
+  local path = config.storage.storeFile
+  local payload = {
+    version = state.store.version or 1,
+    items = state.store.items or {},
+  }
+  local encoded = json.encode(payload, true) or "{}"
+  local ok, err = writeFile(path, encoded)
+  if not ok then
+    log("failed to save store: " .. tostring(err))
+  end
+end
+
+local function scheduleStoreSave()
+  if state.storeSaveTimer then
+    return
+  end
+  local delay = tonumber(config.storage.saveDebounceSeconds) or 0
+  if delay <= 0 then
+    saveStoreNow()
+    return
+  end
+  state.storeSaveTimer = hs.timer.doAfter(delay, function()
+    state.storeSaveTimer = nil
+    saveStoreNow()
+  end)
+end
+
+local function storeHas(itemType, front)
+  ensureStoreLoaded()
+  local key = itemKey({ type = itemType, front = front })
+  return state.storeIndex[key] ~= nil
+end
+
+local function storeUpsert(item, source)
+  ensureStoreLoaded()
+  if type(item) ~= "table" or type(item.front) ~= "string" or item.front == "" then
+    return nil
+  end
+
+  local key = itemKey(item)
+  local existing = state.storeIndex[key]
+  if existing then
+    if type(item.back) == "string" and item.back ~= "" then
+      existing.back = item.back
+    end
+    local meta = sanitizeMeta(item.meta)
+    if meta then
+      existing.meta = existing.meta or {}
+      for k, v in pairs(meta) do
+        if existing.meta[k] == nil then
+          existing.meta[k] = v
+        end
+      end
+    end
+    if source and source ~= "" then
+      existing.meta = existing.meta or {}
+      existing.meta.source = existing.meta.source or source
+    end
+    scheduleStoreSave()
+    return existing
+  end
+
+  local meta = sanitizeMeta(item.meta)
+  if source and source ~= "" then
+    meta = meta or {}
+    meta.source = meta.source or source
+  end
+
+  local rec = {
+    type = item.type or "text",
+    front = item.front,
+    back = (type(item.back) == "string") and item.back or "",
+    meta = meta,
+    createdAt = nowSeconds(),
+    seenCount = 0,
+    lastSeenAt = 0,
+  }
+
+  state.storeIndex[key] = rec
+  table.insert(state.store.items, rec)
+  scheduleStoreSave()
+  return rec
+end
+
+local function storeMarkSeen(item, source)
+  local rec = storeUpsert(item, source)
+  if not rec then
+    return nil
+  end
+  rec.seenCount = (tonumber(rec.seenCount) or 0) + 1
+  rec.lastSeenAt = nowSeconds()
+  scheduleStoreSave()
+  return rec
+end
+
+local function storeRecentFronts(itemType, limit)
+  ensureStoreLoaded()
+  local limitN = tonumber(limit) or 0
+  if limitN <= 0 then
+    return {}
+  end
+
+  local candidates = {}
+  for _, rec in ipairs(state.store.items or {}) do
+    if rec.type == itemType and type(rec.front) == "string" and rec.front ~= "" then
+      table.insert(candidates, rec)
+    end
+  end
+  table.sort(candidates, function(a, b)
+    return (tonumber(a.createdAt) or 0) > (tonumber(b.createdAt) or 0)
+  end)
+
+  local out = {}
+  for i = 1, math.min(limitN, #candidates) do
+    table.insert(out, candidates[i].front)
+  end
+  return out
+end
+
+local function storePickReviewWord()
+  ensureStoreLoaded()
+  local best = nil
+  local bestSeenAt = nil
+
+  for _, rec in ipairs(state.store.items or {}) do
+    if rec.type == "word" and (tonumber(rec.seenCount) or 0) > 0 then
+      local key = itemKey(rec)
+      if key ~= state.lastKey then
+        local seenAt = tonumber(rec.lastSeenAt) or 0
+        if not best or seenAt < (bestSeenAt or 0) then
+          best = rec
+          bestSeenAt = seenAt
+        end
+      end
+    end
+  end
+
+  if not best then
+    -- Allow repeating the last one if we only have one record.
+    for _, rec in ipairs(state.store.items or {}) do
+      if rec.type == "word" and (tonumber(rec.seenCount) or 0) > 0 then
+        best = rec
+        break
+      end
+    end
+  end
+
+  if not best then
+    return nil
+  end
+
+  local item = cloneItem(best)
+  item.meta = item.meta or {}
+  item.meta._phase = "old"
+  item.meta.reviewCount = tonumber(best.seenCount) or 0
+  return item
 end
 
 local function pickFromList(list)
@@ -430,6 +716,28 @@ local function setCanvasTexts(item)
   local isLikelyWord = item.type == "word" or (#front <= 20 and not front:find("%s"))
   local frontSize = isLikelyWord and config.ui.fontSizeWord or config.ui.fontSizeSentence
 
+  local badgeParts = {}
+  if type(item.meta) == "table" then
+    local phase = item.meta._phase or item.meta.phase
+    if phase == "new" then
+      table.insert(badgeParts, "新词")
+    elseif phase == "old" then
+      table.insert(badgeParts, "旧词")
+    elseif phase == "new_sentence" then
+      table.insert(badgeParts, "新句")
+    end
+    if type(item.meta.category) == "string" and item.meta.category ~= "" then
+      table.insert(badgeParts, item.meta.category)
+    end
+    if type(item.meta.reviewCount) == "number" and item.meta.reviewCount > 0 then
+      table.insert(badgeParts, ("复习%d次"):format(item.meta.reviewCount))
+    end
+  end
+  local badge = ""
+  if #badgeParts > 0 then
+    badge = "【" .. table.concat(badgeParts, " ") .. "】 "
+  end
+
   for _, c in ipairs(state.canvases) do
     local canvas = c.canvas
     canvas[c.frontIndex].text = front
@@ -438,12 +746,8 @@ local function setCanvasTexts(item)
     local showBack = state.backRevealed
     canvas[c.backIndex].text = showBack and back or ""
 
-    if state.loading then
-      canvas[c.hintIndex].text = "正在生成…   Esc: 关闭   点击背景: 关闭"
-    else
-      canvas[c.hintIndex].text = showBack and "Space: 隐藏答案   Esc: 关闭   点击背景: 关闭"
-        or "Space: 显示答案   Esc: 关闭   点击背景: 关闭"
-    end
+    canvas[c.hintIndex].text = badge
+      .. (showBack and "Space: 隐藏答案   Esc: 关闭   点击背景: 关闭" or "Space: 显示答案   Esc: 关闭   点击背景: 关闭")
   end
 end
 
@@ -625,6 +929,27 @@ end
 
 function M.show(item)
   cancelPending()
+  if type(item) ~= "table" then
+    return
+  end
+
+  state.lastKey = itemKey(item)
+  hs.settings.set("vocabOverlay.lastKey", state.lastKey)
+
+  if item.type == "word" and type(item.meta) == "table" then
+    local phase = item.meta._phase or item.meta.phase
+    if phase == "new" then
+      state.newWordStreak = (tonumber(state.newWordStreak) or 0) + 1
+      hs.settings.set("vocabOverlay.newWordStreak", state.newWordStreak)
+    elseif phase == "old" then
+      state.newWordStreak = 0
+      hs.settings.set("vocabOverlay.newWordStreak", 0)
+    end
+  end
+
+  local source = (type(item.meta) == "table" and item.meta.source) or "local"
+  storeMarkSeen(item, source)
+
   showItemNoTimer(item)
   startHideTimer(config.displaySeconds)
 end
@@ -700,6 +1025,55 @@ local function collectCategoriesWithWeights()
     end
   end
   return out
+end
+
+local function chooseCategoryWeighted()
+  local cats = collectCategoriesWithWeights()
+  local opts = {}
+  for _, cat in ipairs(cats) do
+    if type(cat.id) == "string" and cat.id ~= "" then
+      table.insert(opts, { weight = tonumber(cat.weight) or 1, value = cat.id })
+    end
+  end
+  return weightedPick(opts)
+end
+
+local function chooseGenerateType()
+  local gen = config.llm and config.llm.generate or {}
+  local opts = {
+    { weight = tonumber(gen.wordWeight) or 0, value = "word" },
+    { weight = tonumber(gen.sentenceWeight) or 0, value = "sentence" },
+  }
+  local picked = weightedPick(opts)
+  return picked or "word"
+end
+
+local function isValidGeneratedItem(item, desiredType)
+  if type(item) ~= "table" then
+    return false
+  end
+  if type(item.front) ~= "string" or trim(item.front) == "" then
+    return false
+  end
+  if desiredType and item.type and item.type ~= desiredType then
+    return false
+  end
+
+  local front = trim(item.front)
+  if desiredType == "word" then
+    if front:find("%s") then
+      return false
+    end
+    if front:find("[\r\n\t]") then
+      return false
+    end
+  elseif desiredType == "sentence" then
+    if not front:find("%s") then
+      return false
+    end
+  end
+
+  return true
 end
 
 local function normalizeItem(raw)
@@ -822,27 +1196,35 @@ local function buildLlmHeaders()
   return headers
 end
 
-local function buildSimplePayload(baseItem)
-  local mode = config.llm.mode or "enrich"
+local function buildSimplePayload(baseItem, opts)
+  local mode = (type(opts) == "table" and opts.mode) or config.llm.mode or "generate"
   local payload = {
     mode = mode,
     preferences = config.llm.preferences or {},
   }
   if mode == "generate" then
     payload.categories = collectCategoryIds()
+    payload.constraints = {
+      type = (type(opts) == "table" and opts.desiredType) or nil,
+      category = (type(opts) == "table" and opts.desiredCategory) or nil,
+      avoid = (type(opts) == "table" and opts.avoidFronts) or nil,
+    }
   else
     payload.item = baseItem
   end
   return payload
 end
 
-local function buildOpenAiMessages(baseItem)
+local function buildOpenAiMessages(baseItem, opts)
   local prefs = config.llm.preferences or {}
   local language = (type(prefs.language) == "string" and prefs.language ~= "") and prefs.language or "zh"
   local style = (type(prefs.style) == "string" and prefs.style ~= "") and prefs.style or "concise"
   local includeExample = prefs.includeExample ~= false
 
-  local mode = config.llm.mode or "enrich"
+  local mode = (type(opts) == "table" and opts.mode) or config.llm.mode or "generate"
+  local desiredType = type(opts) == "table" and opts.desiredType or nil
+  local desiredCategory = type(opts) == "table" and opts.desiredCategory or nil
+  local avoidFronts = type(opts) == "table" and opts.avoidFronts or nil
 
   local systemPrompt = table.concat({
     "You are a language tutor helping a Chinese learner memorize English words and sentences.",
@@ -857,11 +1239,29 @@ local function buildOpenAiMessages(baseItem)
   local userPrompt
   if mode == "generate" then
     local categories = collectCategoriesWithWeights()
+    local desiredLine = ""
+    if desiredType == "word" then
+      desiredLine = "Type requirement: word (a single English word, no spaces)."
+    elseif desiredType == "sentence" then
+      desiredLine = "Type requirement: sentence (a short natural English sentence)."
+    end
+
+    local categoryLine = ""
+    if type(desiredCategory) == "string" and desiredCategory ~= "" then
+      categoryLine = "Target category: " .. desiredCategory .. " (put it into item.meta.category)."
+    end
+
+    local avoidLine = ""
+    if type(avoidFronts) == "table" and #avoidFronts > 0 then
+      avoidLine = "Avoid returning any of these item.front values: " .. (json.encode(avoidFronts) or "[]")
+    end
+
     userPrompt = table.concat({
       "Generate ONE item for spaced repetition.",
-      "Prefer producing a WORD (not a sentence), unless a sentence is clearly better.",
-      "Choose exactly one category from the list below, and put it into item.meta.category.",
+      desiredLine,
+      categoryLine ~= "" and categoryLine or "Choose exactly one category from the list below, and put it into item.meta.category.",
       "Categories (id, weight): " .. (json.encode(categories) or "[]"),
+      avoidLine,
       "",
       'Output JSON only. Example:',
       '{"item":{"type":"word","front":"algorithm","back":"算法；…\\nExample: ...\\n译: ...","meta":{"category":"cs"}}}',
@@ -889,10 +1289,10 @@ local function buildOpenAiMessages(baseItem)
   }
 end
 
-local function buildOpenAiRequest(baseItem)
+local function buildOpenAiRequest(baseItem, opts)
   local req = {
     model = config.llm.model,
-    messages = buildOpenAiMessages(baseItem),
+    messages = buildOpenAiMessages(baseItem, opts),
     temperature = tonumber(config.llm.temperature) or 0.2,
   }
   local maxTokens = tonumber(config.llm.maxTokens)
@@ -902,107 +1302,211 @@ local function buildOpenAiRequest(baseItem)
   return req
 end
 
-local function buildLlmRequest(baseItem)
+local function buildLlmRequest(baseItem, opts)
   local protocol = config.llm.protocol or "simple"
   if protocol == "openai" then
-    return buildOpenAiRequest(baseItem)
+    return buildOpenAiRequest(baseItem, opts)
   end
-  return buildSimplePayload(baseItem)
+  return buildSimplePayload(baseItem, opts)
 end
 
-local function llmRequest(baseItem, callback)
-  local payload = buildLlmRequest(baseItem)
+local function llmRequest(baseItem, opts, callback)
+  local payload = buildLlmRequest(baseItem, opts)
   local body = json.encode(payload) or "{}"
   http.doAsyncRequest(config.llm.endpoint, "POST", body, buildLlmHeaders(), function(code, respBody)
     callback(code, respBody)
   end)
 end
 
-function M.showNext()
-  local mode = config.llm.mode or "enrich"
-  local useLlm = llmEnabled()
+local function showFallback()
+  local item = pickNextItem()
+  if item then
+    M.show(item)
+    return true
+  end
+  local review = storePickReviewWord()
+  if review then
+    M.show(review)
+    return true
+  end
+  return false
+end
 
-  local baseItem = pickNextItem()
-  if not baseItem and not (useLlm and mode == "generate") then
-    hs.alert.show("vocab_overlay: 没有可用条目（检查 data/items.json / sentences.txt / wordlists/*.txt，或开启 llm.generate）")
-    return
+local function buildAvoidList(itemType, extraFronts)
+  local gen = config.llm and config.llm.generate or {}
+  local limit = tonumber(gen.avoidListSize) or 0
+  if limit <= 0 then
+    limit = 0
   end
 
-  if not useLlm then
-    M.show(baseItem)
-    return
-  end
-
-  cancelPending()
-  state.loading = true
-
-  local timeoutSeconds = tonumber(config.llm.timeoutSeconds) or 8
-  local requestId = (state.pending and state.pending.id or 0) + 1
-  state.pending = { id = requestId }
-
-  local fallbackItem = baseItem
-  local provisionalItem
-  if mode == "generate" then
-    provisionalItem = { type = "text", front = "正在生成…", back = "" }
-  else
-    provisionalItem = cloneItem(baseItem) or baseItem
-    provisionalItem.back = ""
-  end
-
-  showItemNoTimer(provisionalItem)
-
-  local finalized = false
-  local function finalize(finalItem)
-    if finalized then
+  local base = storeRecentFronts(itemType, limit)
+  local out = {}
+  local seen = {}
+  local function add(v)
+    if type(v) ~= "string" then
       return
     end
-    finalized = true
-
-    if state.pending and state.pending.timeoutTimer then
-      state.pending.timeoutTimer:stop()
-    end
-    state.pending = nil
-    state.loading = false
-
-    local item = finalItem or fallbackItem
-    if not item then
-      M.hide()
+    v = trim(v)
+    if v == "" then
       return
     end
-
-    state.backRevealed = config.showBackByDefault
-    state.currentItem = item
-    setCanvasTexts(item)
-    startHideTimer(config.displaySeconds)
+    local k = v:lower()
+    if seen[k] then
+      return
+    end
+    seen[k] = true
+    table.insert(out, v)
   end
 
-  state.pending.timeoutTimer = hs.timer.doAfter(timeoutSeconds, function()
-    if not state.pending or state.pending.id ~= requestId then
-      return
+  if type(extraFronts) == "table" then
+    for _, v in ipairs(extraFronts) do
+      add(v)
+      if limit > 0 and #out >= limit then
+        return out
+      end
     end
-    log("llm request timeout; fallback")
-    finalize(fallbackItem)
-  end)
+  end
 
-  llmRequest(baseItem, function(code, body)
+  for _, v in ipairs(base) do
+    add(v)
+    if limit > 0 and #out >= limit then
+      break
+    end
+  end
+  return out
+end
+
+local function requestGenerate(requestId, desiredType, desiredCategory, attempt, extraAvoid)
+  local gen = config.llm and config.llm.generate or {}
+  local maxRetries = tonumber(gen.maxRetries) or 6
+  local attemptN = tonumber(attempt) or 1
+
+  local opts = {
+    mode = "generate",
+    desiredType = desiredType,
+    desiredCategory = desiredCategory,
+    avoidFronts = buildAvoidList(desiredType, extraAvoid),
+  }
+
+  llmRequest(nil, opts, function(code, body)
     if not state.pending or state.pending.id ~= requestId then
       return
     end
 
     if type(code) ~= "number" or code < 200 or code >= 300 then
-      log("llm request failed: " .. tostring(code))
-      finalize(fallbackItem)
+      log(("llm generate failed (attempt %d/%d): %s"):format(attemptN, maxRetries, tostring(code)))
+      if attemptN < maxRetries then
+        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+      else
+        state.pending = nil
+        if not showFallback() then
+          hs.alert.show("vocab_overlay: LLM 失败且无本地数据")
+        end
+      end
       return
     end
 
     local item = parseItemFromResponseBody(body)
-    if not item then
-      log("llm response parse failed; fallback")
-      finalize(fallbackItem)
+    if not isValidGeneratedItem(item, desiredType) then
+      log(("llm generate invalid item (attempt %d/%d)"):format(attemptN, maxRetries))
+      if attemptN < maxRetries then
+        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+      else
+        state.pending = nil
+        if not showFallback() then
+          hs.alert.show("vocab_overlay: LLM 返回无效内容")
+        end
+      end
       return
     end
 
-    if mode == "enrich" and baseItem then
+    item.type = desiredType
+    item.front = trim(item.front):gsub("%s+", " ")
+
+    if desiredType == "word" and not item.front:match("[%a]") then
+      if attemptN < maxRetries then
+        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+      else
+        state.pending = nil
+        showFallback()
+      end
+      return
+    end
+
+    if storeHas(desiredType, item.front) then
+      log(("duplicate generated, retrying: %s"):format(item.front))
+      local nextAvoid = extraAvoid or {}
+      table.insert(nextAvoid, item.front)
+      if attemptN < maxRetries then
+        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, nextAvoid)
+      else
+        state.pending = nil
+        showFallback()
+      end
+      return
+    end
+
+    item.meta = item.meta or {}
+    item.meta.source = item.meta.source or "llm"
+    if desiredType == "word" then
+      item.meta.category = item.meta.category or desiredCategory
+      item.meta._phase = "new"
+    else
+      item.meta._phase = "new_sentence"
+    end
+
+    M.show(item)
+  end)
+end
+
+function M.showNext()
+  local useLlm = llmEnabled()
+  local mode = config.llm.mode or "generate"
+
+  if not useLlm then
+    local item = pickNextItem()
+    if not item then
+      hs.alert.show("vocab_overlay: 没有可用条目（检查 data/items.json / sentences.txt / wordlists/*.txt）")
+      return
+    end
+    M.show(item)
+    return
+  end
+
+  if mode ~= "generate" then
+    local baseItem = pickNextItem()
+    if not baseItem then
+      hs.alert.show("vocab_overlay: 没有可用条目用于 enrich（请先准备本地词库/句库）")
+      return
+    end
+
+    cancelPending()
+    local requestId = (state.pending and state.pending.id or 0) + 1
+    state.pending = { id = requestId }
+
+    state.pending.timeoutTimer = hs.timer.doAfter(tonumber(config.llm.timeoutSeconds) or 8, function()
+      if not state.pending or state.pending.id ~= requestId then
+        return
+      end
+      state.pending = nil
+      M.show(baseItem)
+    end)
+
+    llmRequest(baseItem, { mode = "enrich" }, function(code, body)
+      if not state.pending or state.pending.id ~= requestId then
+        return
+      end
+      if type(code) ~= "number" or code < 200 or code >= 300 then
+        state.pending = nil
+        M.show(baseItem)
+        return
+      end
+      local item = parseItemFromResponseBody(body)
+      if not item then
+        state.pending = nil
+        M.show(baseItem)
+        return
+      end
       if item.type == nil or item.type == "text" then
         item.type = baseItem.type
       end
@@ -1011,10 +1515,44 @@ function M.showNext()
         item.back = baseItem.back or ""
       end
       item.meta = item.meta or baseItem.meta
-    end
+      M.show(item)
+    end)
+    return
+  end
 
-    finalize(item)
+  -- generate mode (live): generate first, then show. Also interleave old words.
+  ensureStoreLoaded()
+
+  local gen = config.llm and config.llm.generate or {}
+  local reviewEvery = tonumber(gen.newWordsBeforeReview) or 0
+  if reviewEvery > 0 and (tonumber(state.newWordStreak) or 0) >= reviewEvery then
+    local review = storePickReviewWord()
+    if review then
+      M.show(review)
+      return
+    end
+  end
+
+  cancelPending()
+  local requestId = (state.pending and state.pending.id or 0) + 1
+  state.pending = { id = requestId }
+
+  state.pending.timeoutTimer = hs.timer.doAfter(tonumber(config.llm.timeoutSeconds) or 8, function()
+    if not state.pending or state.pending.id ~= requestId then
+      return
+    end
+    log("llm request timeout; fallback")
+    state.pending = nil
+    showFallback()
   end)
+
+  local desiredType = chooseGenerateType()
+  local desiredCategory = nil
+  if desiredType == "word" then
+    desiredCategory = chooseCategoryWeighted()
+  end
+
+  requestGenerate(requestId, desiredType, desiredCategory, 1, {})
 end
 
 function M.startTimer()
@@ -1048,7 +1586,16 @@ end
 
 function M.reload()
   loadAllSources()
-  hs.alert.show("vocab_overlay: 已重新加载本地数据")
+  if state.storeSaveTimer then
+    state.storeSaveTimer:stop()
+    state.storeSaveTimer = nil
+    saveStoreNow()
+  end
+  state.store = nil
+  state.storeIndex = nil
+  ensureStoreLoaded()
+  state.newWordStreak = hs.settings.get("vocabOverlay.newWordStreak") or 0
+  hs.alert.show("vocab_overlay: 已重新加载本地数据与学习记录")
 end
 
 local function bindHotkeys()
@@ -1093,6 +1640,7 @@ function M.start()
 
   math.randomseed(os.time())
   loadAllSources()
+  ensureStoreLoaded()
   setupModal()
   bindHotkeys()
   watchScreens()
