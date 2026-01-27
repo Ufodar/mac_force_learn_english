@@ -101,9 +101,8 @@ Reload 后，菜单栏会出现 **EN**。
   - **勿扰模式**：定时弹窗不再打断你（仍可手动弹出/复习）
   - **查看统计**：已学单词/句子、复习次数、例句数
 
-- `Ctrl+Alt+Cmd+V`：立刻弹出下一条
-- `Ctrl+Alt+Cmd+T`：开/关定时弹出
-- `Ctrl+Alt+Cmd+I`：重新加载本地数据（词库/句子/items.json）
+> 默认不启用全局快捷键（避免冲突）。如需开启，在 `~/.hammerspoon/vocab_overlay.lua` 里把 `config.hotkeys.enabled = true`。
+
 - 弹窗显示时：
   - `Space`：显示/隐藏答案（back）
   - `N`：下一条（复习模式下为“下一条旧词”）

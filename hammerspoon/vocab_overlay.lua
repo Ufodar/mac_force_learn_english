@@ -93,6 +93,7 @@ local config = {
   },
 
   hotkeys = {
+    enabled = false, -- set true if you want global shortcuts
     showNow = { { "ctrl", "alt", "cmd" }, "V" },
     toggleTimer = { { "ctrl", "alt", "cmd" }, "T" },
     reloadData = { { "ctrl", "alt", "cmd" }, "I" },
@@ -2587,6 +2588,9 @@ function M.reload()
 end
 
 local function bindHotkeys()
+  if not (config.hotkeys and config.hotkeys.enabled) then
+    return
+  end
   hs.hotkey.bind(config.hotkeys.showNow[1], config.hotkeys.showNow[2], function()
     M.showNext({ manual = true })
   end)
