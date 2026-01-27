@@ -100,7 +100,8 @@ local config = {
   },
 
   ui = {
-    menuBarTitle = "VO",
+    menuBarTitle = "", -- keep empty to use icon-only (more likely to fit in a crowded menubar)
+    menuBarHighlightSeconds = 6,
     overlayColor = { white = 0, alpha = 0.38 },
     cardColor = { white = 1, alpha = 0.96 },
     cardStrokeColor = { white = 0, alpha = 0.08 },
@@ -2626,7 +2627,24 @@ local function setupMenuBar()
     hs.alert.show("vocab_overlay：无法创建菜单栏按钮", 2.5)
     return
   end
-  mb:setTitle((config.ui and config.ui.menuBarTitle) or "VO")
+  local title = (config.ui and config.ui.menuBarTitle)
+  if type(title) ~= "string" then
+    title = ""
+  end
+
+  -- Prefer a small icon so it survives a crowded/notched menubar.
+  local icon = nil
+  pcall(function()
+    local image = require("hs.image")
+    icon = image.imageFromName(image.systemImageNames.RevealFreestandingTemplate) or image.imageFromName("statusicon")
+  end)
+  if icon then
+    pcall(function()
+      mb:setIcon(icon, true)
+    end)
+  end
+
+  mb:setTitle(title)
   mb:setTooltip("Vocab Overlay")
   mb:setMenu(function()
     local timerOn = state.intervalTimer ~= nil
@@ -2672,9 +2690,55 @@ local function setupMenuBar()
   end)
   state.menuBar = mb
 
+  local function highlightMenuBarOnce()
+    local seconds = (config.ui and tonumber(config.ui.menuBarHighlightSeconds)) or 0
+    if seconds <= 0 then
+      return
+    end
+    hs.timer.doAfter(0.25, function()
+      if not state.menuBar or not state.menuBar.frame then
+        return
+      end
+      local frame = state.menuBar:frame()
+      if not frame then
+        hs.alert.show("VO：菜单栏按钮可能被隐藏（菜单栏太满 / Bartender/Hidden Bar）\n我已自动打开设置", 6.0)
+        if M.openSettings then
+          hs.timer.doAfter(0.1, function()
+            M.openSettings()
+          end)
+        end
+        return
+      end
+
+      local ok, drawing = pcall(require, "hs.drawing")
+      if not ok or not drawing then
+        return
+      end
+      local rect = drawing.rectangle(frame)
+      rect:setStrokeColor({ red = 1, green = 0.2, blue = 0.2, alpha = 0.95 })
+      rect:setFill(false)
+      rect:setStrokeWidth(3)
+      rect:setRoundedRectRadii(4, 4)
+      rect:bringToFront(true)
+      rect:show()
+      hs.timer.doAfter(seconds, function()
+        pcall(function()
+          rect:delete()
+        end)
+      end)
+    end)
+  end
+
   if not hs.settings.get("vocabOverlay._firstRunShown") then
     hs.settings.set("vocabOverlay._firstRunShown", true)
-    hs.alert.show("VO 已启动：点菜单栏 VO → 设置… / 现在弹出", 3.0)
+    hs.alert.show("VO 已启动：点菜单栏右上角小图标 → 设置… / 现在弹出", 6.0)
+    highlightMenuBarOnce()
+  else
+    -- If user still can't find the icon, highlight it after reload as well.
+    if not hs.settings.get("vocabOverlay._highlightedOnce") then
+      hs.settings.set("vocabOverlay._highlightedOnce", true)
+      highlightMenuBarOnce()
+    end
   end
 end
 
