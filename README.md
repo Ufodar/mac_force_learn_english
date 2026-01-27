@@ -7,20 +7,19 @@
 1. 安装 Hammerspoon：`brew install --cask hammerspoon`（或去官网下载安装）
 2. 第一次打开会提示权限：在 **系统设置 → 隐私与安全性 → 辅助功能** 里勾选 **Hammerspoon**
 
-## 2) 放置配置
+## 2) 一键安装（推荐）
 
-把本目录下 `hammerspoon/` 里的文件放到你的 `~/.hammerspoon/`：
+克隆并安装：
 
 ```bash
-mkdir -p ~/.hammerspoon/data
-cp -R mac-vocab-overlay/hammerspoon/* ~/.hammerspoon/
+git clone https://github.com/Ufodar/mac_force_learn_english.git
+cd mac_force_learn_english
+bash install.sh
 ```
 
-如果你已经有自己的 `~/.hammerspoon/init.lua`，不要覆盖它，只需要把 `vocab_overlay.lua` 和 `data/items.json` 复制进去，然后在你自己的 `init.lua` 里加一行：
+然后在 Hammerspoon 菜单里点 **Reload Config**（或 `⌘R`）生效。
 
-```lua
-require("vocab_overlay").start()
-```
+> 说明：`install.sh` 会把 `vocab_overlay.lua` 安装到 `~/.hammerspoon/`，并在你的 `~/.hammerspoon/init.lua` 里（如缺失）追加一行启动代码；不会覆盖你已有的 `items.json/sentences.txt/wordlists`（若已存在则跳过拷贝）。
 
 ## 3) 数据源（可混用）
 
@@ -58,7 +57,7 @@ require("vocab_overlay").start()
 
 ## 3.5) 可选：接入大模型（自动补全释义/例句）
 
-你可以在 `~/.hammerspoon/vocab_overlay.lua` 里开启：
+推荐用菜单栏 **EN → 设置…** 来配置（无需改代码）。等价的代码配置如下（仅供参考）：
 
 ```lua
 llm = {
@@ -80,7 +79,7 @@ llm = {
 { "item": { "type": "word", "front": "algorithm", "back": "算法；…\\nExample: ...\\n译: ...", "meta": { "category": "cs" } } }
 ```
 
-生成出来的内容会自动保存到：`~/.hammerspoon/data/generated_store.json`，并且会按 `newWordsBeforeReview` 规则穿插复习旧词（默认每 3 个新词插入 1 个旧词复习，可在 `config.llm.generate` 里改）。
+生成出来的内容会自动保存到：`~/.hammerspoon/data/generated_store.json`（包含已生成的词/句、复习次数、例句历史），并且会按 `newWordsBeforeReview` 规则穿插复习旧词（默认每 3 个新词插入 1 个旧词复习，可在菜单栏设置里改）。
 
 ### `protocol = "simple"`（你想自定义接口时）
 
@@ -94,13 +93,22 @@ llm = {
 
 ## 4) 使用与快捷键
 
-在 Hammerspoon 菜单里点 **Reload Config**（或 `⌘R`）后生效。
+Reload 后，菜单栏会出现 **EN**。
+
+- 菜单栏 **EN**：
+  - **设置…**：配置 LLM / 定时 / 复习插入规则
+  - **复习模式**：主动复习旧词（不会自动消失；`N` 下一条；`Esc` 退出）
+  - **勿扰模式**：定时弹窗不再打断你（仍可手动弹出/复习）
+  - **查看统计**：已学单词/句子、复习次数、例句数
 
 - `Ctrl+Alt+Cmd+V`：立刻弹出下一条
 - `Ctrl+Alt+Cmd+T`：开/关定时弹出
 - `Ctrl+Alt+Cmd+I`：重新加载本地数据（词库/句子/items.json）
 - 弹窗显示时：
   - `Space`：显示/隐藏答案（back）
+  - `N`：下一条（复习模式下为“下一条旧词”）
+  - `E`：生成一个**新例句**（需要 LLM；会保存并复用）
+  - `D`：切换勿扰模式
   - `Esc`：关闭弹窗
   - 鼠标点击卡片：显示/隐藏答案；点击黑色背景：关闭
 

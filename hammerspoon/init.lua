@@ -2,4 +2,6 @@
 -- copy vocab_overlay.lua into ~/.hammerspoon/ and call:
 --   require("vocab_overlay").start()
 -- (Dock icon hiding is controlled by vocab_overlay.lua -> config.hideDockIcon)
-require("vocab_overlay").start()
+pcall(function()
+  require("vocab_overlay").start()
+end)

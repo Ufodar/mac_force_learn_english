@@ -9,6 +9,25 @@ local json = require("hs.json")
 local http = require("hs.http")
 local fs = require("hs.fs")
 
+local SETTINGS_KEYS = {
+  userConfig = "vocabOverlay.userConfig",
+  dnd = "vocabOverlay.dndEnabled",
+  reviewMode = "vocabOverlay.reviewMode",
+}
+
+local function deepMerge(target, source)
+  if type(target) ~= "table" or type(source) ~= "table" then
+    return
+  end
+  for k, v in pairs(source) do
+    if type(v) == "table" and type(target[k]) == "table" then
+      deepMerge(target[k], v)
+    else
+      target[k] = v
+    end
+  end
+end
+
 local config = {
   intervalSeconds = 20 * 60, -- every 20 minutes
   displaySeconds = 8,        -- stay on screen for 8 seconds
@@ -55,6 +74,10 @@ local config = {
       newWordsBeforeReview = 3, -- after N new words, show 1 review word
       avoidListSize = 40,
       maxRetries = 6,
+    },
+    example = {
+      avoidListSize = 12,
+      maxRetries = 4,
     },
     extraHeaders = {},
     preferences = {
@@ -103,6 +126,11 @@ local config = {
   },
 }
 
+local userConfig = hs.settings.get(SETTINGS_KEYS.userConfig)
+if type(userConfig) == "table" then
+  deepMerge(config, userConfig)
+end
+
 local state = {
   items = nil,
   sentences = nil,
@@ -114,8 +142,14 @@ local state = {
   visible = false,
   backRevealed = false,
   currentItem = nil,
+  currentAutoHide = true,
   loading = false,
   pending = nil,
+  dndEnabled = hs.settings.get(SETTINGS_KEYS.dnd) or false,
+  reviewMode = hs.settings.get(SETTINGS_KEYS.reviewMode) or false,
+  menuBar = nil,
+  settingsView = nil,
+  settingsController = nil,
 
   hideTimer = nil,
   intervalTimer = nil,
@@ -128,6 +162,8 @@ local state = {
   modal = nil,
   initialized = false,
 }
+
+local llmEnabled -- forward declaration; assigned later
 
 local function log(msg)
   print("[vocab_overlay] " .. msg)
@@ -405,6 +441,31 @@ local function sanitizeMeta(meta)
   return out
 end
 
+local function normalizeExample(raw)
+  if type(raw) ~= "table" then
+    return nil
+  end
+  local en = raw.en or raw.exampleEn or raw.example or raw[1]
+  local zh = raw.zh or raw.exampleZh or raw.translation or raw[2]
+  if type(en) ~= "string" then
+    return nil
+  end
+  en = trim(en):gsub("%s+", " ")
+  if en == "" then
+    return nil
+  end
+  if type(zh) ~= "string" then
+    zh = ""
+  end
+  zh = trim(zh)
+  return {
+    en = en,
+    zh = zh,
+    createdAt = tonumber(raw.createdAt) or 0,
+    source = raw.source,
+  }
+end
+
 local function ensureStoreLoaded()
   if state.store and state.storeIndex then
     return
@@ -435,6 +496,24 @@ local function ensureStoreLoaded()
       local front = raw.front or raw.q or raw.word or raw.sentence or raw[1]
       local back = raw.back or raw.a or raw.meaning or raw.translation or raw[2]
       if type(front) == "string" and front ~= "" then
+        local examples = {}
+        local exampleIndex = {}
+        if type(raw.examples) == "table" then
+          for _, ex in ipairs(raw.examples) do
+            local normalized = normalizeExample(ex)
+            if normalized then
+              local keyEx = normalized.en:lower()
+              if not exampleIndex[keyEx] then
+                exampleIndex[keyEx] = true
+                if normalized.createdAt <= 0 then
+                  normalized.createdAt = nowSeconds()
+                end
+                table.insert(examples, normalized)
+              end
+            end
+          end
+        end
+
         local rec = {
           type = raw.type or "text",
           front = front,
@@ -443,6 +522,7 @@ local function ensureStoreLoaded()
           createdAt = tonumber(raw.createdAt) or 0,
           seenCount = tonumber(raw.seenCount) or 0,
           lastSeenAt = tonumber(raw.lastSeenAt) or 0,
+          examples = examples,
         }
         if rec.createdAt <= 0 then
           rec.createdAt = nowSeconds()
@@ -457,6 +537,22 @@ local function ensureStoreLoaded()
           existing.lastSeenAt = math.max(existing.lastSeenAt or 0, rec.lastSeenAt or 0)
           existing.createdAt = math.min(existing.createdAt or rec.createdAt, rec.createdAt)
           existing.meta = existing.meta or rec.meta
+          existing.examples = existing.examples or {}
+          local existingExamplesIndex = {}
+          for _, ex in ipairs(existing.examples) do
+            if type(ex) == "table" and type(ex.en) == "string" then
+              existingExamplesIndex[ex.en:lower()] = true
+            end
+          end
+          for _, ex in ipairs(rec.examples or {}) do
+            if type(ex) == "table" and type(ex.en) == "string" then
+              local kex = ex.en:lower()
+              if not existingExamplesIndex[kex] then
+                existingExamplesIndex[kex] = true
+                table.insert(existing.examples, ex)
+              end
+            end
+          end
         else
           index[key] = rec
           table.insert(items, rec)
@@ -513,6 +609,7 @@ local function storeUpsert(item, source)
   local key = itemKey(item)
   local existing = state.storeIndex[key]
   if existing then
+    existing.examples = existing.examples or {}
     if type(item.back) == "string" and item.back ~= "" then
       existing.back = item.back
     end
@@ -547,12 +644,98 @@ local function storeUpsert(item, source)
     createdAt = nowSeconds(),
     seenCount = 0,
     lastSeenAt = 0,
+    examples = {},
   }
 
   state.storeIndex[key] = rec
   table.insert(state.store.items, rec)
   scheduleStoreSave()
   return rec
+end
+
+local function storeGetRecord(item)
+  ensureStoreLoaded()
+  if type(item) ~= "table" then
+    return nil
+  end
+  local key = itemKey(item)
+  return state.storeIndex[key]
+end
+
+local function storeAddExample(item, example, source)
+  ensureStoreLoaded()
+  if type(item) ~= "table" then
+    return nil
+  end
+  local rec = storeUpsert(item, source)
+  if not rec then
+    return nil
+  end
+  rec.examples = rec.examples or {}
+
+  local ex = normalizeExample(example)
+  if not ex then
+    return nil
+  end
+  ex.source = ex.source or source
+  if ex.createdAt <= 0 then
+    ex.createdAt = nowSeconds()
+  end
+
+  local kex = ex.en:lower()
+  for _, existing in ipairs(rec.examples) do
+    if type(existing) == "table" and type(existing.en) == "string" and existing.en:lower() == kex then
+      if existing.zh == "" and ex.zh ~= "" then
+        existing.zh = ex.zh
+      end
+      return existing
+    end
+  end
+
+  table.insert(rec.examples, ex)
+  scheduleStoreSave()
+  return ex
+end
+
+local function storeLatestExample(item)
+  local rec = storeGetRecord(item)
+  if not rec or type(rec.examples) ~= "table" or #rec.examples == 0 then
+    return nil
+  end
+  local best = rec.examples[1]
+  for _, ex in ipairs(rec.examples) do
+    if (tonumber(ex.createdAt) or 0) >= (tonumber(best.createdAt) or 0) then
+      best = ex
+    end
+  end
+  return best
+end
+
+local function extractExampleFromBack(back)
+  if type(back) ~= "string" or back == "" then
+    return nil
+  end
+
+  local en = back:match("[Ee]xample[:：]%s*(.-)\n") or back:match("例句[:：]%s*(.-)\n")
+  if not en then
+    en = back:match("[Ee]xample[:：]%s*(.+)$") or back:match("例句[:：]%s*(.+)$")
+  end
+  if type(en) == "string" then
+    en = trim(en):gsub("%s+", " ")
+  end
+  if not en or en == "" then
+    return nil
+  end
+
+  local zh = back:match("译[:：]%s*(.-)\n") or back:match("翻译[:：]%s*(.-)\n") or back:match("译[:：]%s*(.+)$")
+    or back:match("翻译[:：]%s*(.+)$")
+  if type(zh) == "string" then
+    zh = trim(zh)
+  else
+    zh = ""
+  end
+
+  return { en = en, zh = zh }
 end
 
 local function storeMarkSeen(item, source)
@@ -562,6 +745,13 @@ local function storeMarkSeen(item, source)
   end
   rec.seenCount = (tonumber(rec.seenCount) or 0) + 1
   rec.lastSeenAt = nowSeconds()
+
+  -- If the item's back already contains an example, extract & store it.
+  local extracted = extractExampleFromBack(item.back)
+  if extracted then
+    storeAddExample(item, extracted, source)
+  end
+
   scheduleStoreSave()
   return rec
 end
@@ -709,9 +899,57 @@ local function stopHideTimer()
   end
 end
 
+local function backAlreadyContainsExample(back)
+  if type(back) ~= "string" then
+    return false
+  end
+  return back:find("[Ee]xample[:：]") ~= nil or back:find("例句[:：]") ~= nil
+end
+
+local function isExampleLoading(item)
+  if type(item) ~= "table" then
+    return false
+  end
+  if type(item.meta) ~= "table" then
+    return false
+  end
+  local t = item.meta._transient
+  return type(t) == "table" and t.exampleLoading == true
+end
+
+local function buildDisplayBack(item)
+  local baseBack = (type(item) == "table" and type(item.back) == "string") and trim(item.back) or ""
+  local ex = storeLatestExample(item)
+  local loading = isExampleLoading(item)
+
+  if (not ex or (ex.zh == "" and ex.en == "")) and not loading then
+    return baseBack
+  end
+
+  if backAlreadyContainsExample(baseBack) then
+    return baseBack
+  end
+
+  local parts = {}
+  if baseBack ~= "" then
+    table.insert(parts, baseBack)
+  end
+
+  if ex and type(ex.en) == "string" and ex.en ~= "" then
+    table.insert(parts, "Example: " .. ex.en)
+    if type(ex.zh) == "string" and ex.zh ~= "" then
+      table.insert(parts, "译: " .. ex.zh)
+    end
+  elseif loading then
+    table.insert(parts, "Example: (生成中...)")
+  end
+
+  return table.concat(parts, "\n")
+end
+
 local function setCanvasTexts(item)
   local front = item.front or ""
-  local back = item.back or ""
+  local back = buildDisplayBack(item)
 
   local isLikelyWord = item.type == "word" or (#front <= 20 and not front:find("%s"))
   local frontSize = isLikelyWord and config.ui.fontSizeWord or config.ui.fontSizeSentence
@@ -746,8 +984,16 @@ local function setCanvasTexts(item)
     local showBack = state.backRevealed
     canvas[c.backIndex].text = showBack and back or ""
 
-    canvas[c.hintIndex].text = badge
-      .. (showBack and "Space: 隐藏答案   Esc: 关闭   点击背景: 关闭" or "Space: 显示答案   Esc: 关闭   点击背景: 关闭")
+    local hint = showBack and "Space: 隐藏答案" or "Space: 显示答案"
+    hint = hint .. "   N: 下一条"
+    if llmEnabled() and isLikelyWord then
+      hint = hint .. "   E: 新例句"
+    end
+    if state.dndEnabled then
+      hint = hint .. "   DND: 开"
+    end
+    local escHint = state.reviewMode and "Esc: 退出复习" or "Esc: 关闭"
+    canvas[c.hintIndex].text = badge .. hint .. "   " .. escHint
   end
 end
 
@@ -927,10 +1173,17 @@ local function showItemNoTimer(item)
   enterModal()
 end
 
-function M.show(item)
+function M.show(item, opts)
   cancelPending()
   if type(item) ~= "table" then
     return
+  end
+  if type(opts) ~= "table" then
+    opts = {}
+  end
+  local autoHide = opts.autoHide
+  if autoHide == nil then
+    autoHide = true
   end
 
   state.lastKey = itemKey(item)
@@ -951,7 +1204,10 @@ function M.show(item)
   storeMarkSeen(item, source)
 
   showItemNoTimer(item)
-  startHideTimer(config.displaySeconds)
+  state.currentAutoHide = autoHide and true or false
+  if state.currentAutoHide then
+    startHideTimer(config.displaySeconds)
+  end
 end
 
 function M.hide()
@@ -985,7 +1241,7 @@ function M.toggleBack()
   end
 end
 
-local function llmEnabled()
+llmEnabled = function()
   if not (config.llm and config.llm.enabled) then
     return false
   end
@@ -1175,6 +1431,60 @@ local function parseItemFromResponseBody(body)
   return nil
 end
 
+local function parseExampleFromResponseBody(body)
+  local data = decodeJsonMaybe(body)
+  if not data then
+    local extracted = extractFirstJson(body)
+    if extracted then
+      data = decodeJsonMaybe(extracted)
+    end
+  end
+  if not data then
+    return nil
+  end
+
+  local candidate = nil
+  if type(data) == "table" then
+    if type(data.example) == "table" then
+      candidate = data.example
+    elseif type(data.examples) == "table" and type(data.examples[1]) == "table" then
+      candidate = data.examples[1]
+    end
+  end
+
+  -- OpenAI-compatible: parse from choices[1].message.content / choices[1].text
+  if not candidate and type(data) == "table" and type(data.choices) == "table" and type(data.choices[1]) == "table" then
+    local content = (data.choices[1].message and data.choices[1].message.content) or data.choices[1].text
+    local extracted = extractFirstJson(content or "")
+    local decoded = decodeJsonMaybe(extracted or "")
+    if decoded then
+      candidate = decoded.example or (type(decoded.examples) == "table" and decoded.examples[1]) or decoded
+    end
+  end
+
+  if not candidate then
+    candidate = data
+  end
+
+  if type(candidate) == "string" then
+    local inner = decodeJsonMaybe(candidate) or decodeJsonMaybe(extractFirstJson(candidate) or "")
+    if inner then
+      candidate = inner.example or (type(inner.examples) == "table" and inner.examples[1]) or inner
+    end
+  end
+
+  if type(candidate) == "table" and type(candidate[1]) == "table" then
+    candidate = candidate[1]
+  end
+
+  local ex = normalizeExample(candidate)
+  if ex then
+    return ex
+  end
+
+  return nil
+end
+
 local function buildLlmHeaders()
   local headers = { ["Content-Type"] = "application/json" }
   for k, v in pairs(config.llm.extraHeaders or {}) do
@@ -1209,6 +1519,11 @@ local function buildSimplePayload(baseItem, opts)
       category = (type(opts) == "table" and opts.desiredCategory) or nil,
       avoid = (type(opts) == "table" and opts.avoidFronts) or nil,
     }
+  elseif mode == "example" then
+    payload.item = baseItem
+    payload.constraints = {
+      avoidExamples = (type(opts) == "table" and opts.avoidExamples) or nil,
+    }
   else
     payload.item = baseItem
   end
@@ -1222,6 +1537,42 @@ local function buildOpenAiMessages(baseItem, opts)
   local includeExample = prefs.includeExample ~= false
 
   local mode = (type(opts) == "table" and opts.mode) or config.llm.mode or "generate"
+
+  if mode == "example" then
+    local systemPrompt = table.concat({
+      "You are a language tutor helping a Chinese learner memorize English words.",
+      "Return STRICT JSON only. No markdown. No extra text.",
+      'Schema: {"example":{"en":"...","zh":"..."}}',
+      'The "en" must be a short natural English sentence and MUST contain the given word.',
+      'The "zh" must be in ' .. language .. ".",
+      "Keep it " .. style .. " and easy to review quickly.",
+    }, "\n")
+
+    local avoidLine = ""
+    if type(opts) == "table" and type(opts.avoidExamples) == "table" and #opts.avoidExamples > 0 then
+      avoidLine = "Avoid using any of these example sentences: " .. (json.encode(opts.avoidExamples) or "[]")
+    end
+
+    local word = (type(baseItem) == "table" and type(baseItem.front) == "string") and trim(baseItem.front) or ""
+    local meaning = (type(baseItem) == "table" and type(baseItem.back) == "string") and trim(baseItem.back) or ""
+    local meaningLine = (meaning ~= "") and ("Meaning/context (may be empty): " .. meaning) or ""
+
+    local userPrompt = table.concat({
+      "Generate ONE example sentence for spaced repetition.",
+      'Target word: "' .. word .. '"',
+      meaningLine,
+      avoidLine,
+      "",
+      "Output JSON only.",
+      '{"example":{"en":"...","zh":"..."}}',
+    }, "\n")
+
+    return {
+      { role = "system", content = systemPrompt },
+      { role = "user", content = userPrompt },
+    }
+  end
+
   local desiredType = type(opts) == "table" and opts.desiredType or nil
   local desiredCategory = type(opts) == "table" and opts.desiredCategory or nil
   local avoidFronts = type(opts) == "table" and opts.avoidFronts or nil
@@ -1376,6 +1727,87 @@ local function buildAvoidList(itemType, extraFronts)
   return out
 end
 
+local function buildExampleAvoidList(item, extraExamples)
+  local exCfg = config.llm and config.llm.example or {}
+  local limit = tonumber(exCfg.avoidListSize) or 0
+  if limit <= 0 then
+    limit = 0
+  end
+
+  local out = {}
+  local seen = {}
+  local function add(v)
+    if type(v) ~= "string" then
+      return
+    end
+    v = trim(v):gsub("%s+", " ")
+    if v == "" then
+      return
+    end
+    local k = v:lower()
+    if seen[k] then
+      return
+    end
+    seen[k] = true
+    table.insert(out, v)
+  end
+
+  if type(extraExamples) == "table" then
+    for _, v in ipairs(extraExamples) do
+      add(v)
+      if limit > 0 and #out >= limit then
+        return out
+      end
+    end
+  end
+
+  local rec = storeGetRecord(item)
+  if rec and type(rec.examples) == "table" then
+    for _, ex in ipairs(rec.examples) do
+      if type(ex) == "table" and type(ex.en) == "string" then
+        add(ex.en)
+        if limit > 0 and #out >= limit then
+          break
+        end
+      end
+    end
+  end
+
+  return out
+end
+
+local function recordHasExample(item, en)
+  if type(en) ~= "string" or en == "" then
+    return false
+  end
+  local rec = storeGetRecord(item)
+  if not rec or type(rec.examples) ~= "table" then
+    return false
+  end
+  local target = en:lower()
+  for _, ex in ipairs(rec.examples) do
+    if type(ex) == "table" and type(ex.en) == "string" and ex.en:lower() == target then
+      return true
+    end
+  end
+  return false
+end
+
+local function exampleContainsWord(exampleEn, word)
+  if type(exampleEn) ~= "string" or exampleEn == "" then
+    return false
+  end
+  if type(word) ~= "string" or word == "" then
+    return true
+  end
+  local hay = exampleEn:lower()
+  local needle = trim(word):lower()
+  if needle == "" then
+    return true
+  end
+  return hay:find(needle, 1, true) ~= nil
+end
+
 local function requestGenerate(requestId, desiredType, desiredCategory, attempt, extraAvoid)
   local gen = config.llm and config.llm.generate or {}
   local maxRetries = tonumber(gen.maxRetries) or 6
@@ -1456,6 +1888,123 @@ local function requestGenerate(requestId, desiredType, desiredCategory, attempt,
     end
 
     M.show(item)
+  end)
+end
+
+local function clearCurrentExampleLoading(itemKeyExpected)
+  local cur = state.currentItem
+  if not cur or itemKey(cur) ~= itemKeyExpected then
+    return
+  end
+  if type(cur.meta) ~= "table" or type(cur.meta._transient) ~= "table" then
+    return
+  end
+  cur.meta._transient.exampleLoading = nil
+  if next(cur.meta._transient) == nil then
+    cur.meta._transient = nil
+  end
+end
+
+local function requestExample(requestId, item, attempt, extraAvoidExamples, opts)
+  local exCfg = config.llm and config.llm.example or {}
+  local maxRetries = tonumber(exCfg.maxRetries) or 4
+  local attemptN = tonumber(attempt) or 1
+  local itemKeyExpected = itemKey(item)
+
+  local reqOpts = {
+    mode = "example",
+    avoidExamples = buildExampleAvoidList(item, extraAvoidExamples),
+  }
+
+  llmRequest(item, reqOpts, function(code, body)
+    if not state.pending or state.pending.id ~= requestId then
+      return
+    end
+
+    if type(code) ~= "number" or code < 200 or code >= 300 then
+      log(("llm example failed (attempt %d/%d): %s"):format(attemptN, maxRetries, tostring(code)))
+      if attemptN < maxRetries then
+        requestExample(requestId, item, attemptN + 1, extraAvoidExamples, opts)
+      else
+        local silent = type(opts) == "table" and opts.silent
+        state.pending = nil
+        clearCurrentExampleLoading(itemKeyExpected)
+        if state.currentItem and itemKey(state.currentItem) == itemKeyExpected then
+          setCanvasTexts(state.currentItem)
+          if state.currentAutoHide then
+            startHideTimer(config.displaySeconds)
+          end
+        end
+        if not silent then
+          hs.alert.show("例句生成失败", 1.8)
+        end
+      end
+      return
+    end
+
+    local ex = parseExampleFromResponseBody(body)
+    if not ex or not exampleContainsWord(ex.en, item.front) then
+      log(("llm example invalid (attempt %d/%d)"):format(attemptN, maxRetries))
+      local nextAvoid = extraAvoidExamples or {}
+      if ex and type(ex.en) == "string" and ex.en ~= "" then
+        table.insert(nextAvoid, ex.en)
+      end
+      if attemptN < maxRetries then
+        requestExample(requestId, item, attemptN + 1, nextAvoid, opts)
+      else
+        local silent = type(opts) == "table" and opts.silent
+        state.pending = nil
+        clearCurrentExampleLoading(itemKeyExpected)
+        if state.currentItem and itemKey(state.currentItem) == itemKeyExpected then
+          setCanvasTexts(state.currentItem)
+          if state.currentAutoHide then
+            startHideTimer(config.displaySeconds)
+          end
+        end
+        if not silent then
+          hs.alert.show("例句生成无效", 1.8)
+        end
+      end
+      return
+    end
+
+    if recordHasExample(item, ex.en) then
+      local nextAvoid = extraAvoidExamples or {}
+      table.insert(nextAvoid, ex.en)
+      if attemptN < maxRetries then
+        requestExample(requestId, item, attemptN + 1, nextAvoid, opts)
+      else
+        local silent = type(opts) == "table" and opts.silent
+        state.pending = nil
+        clearCurrentExampleLoading(itemKeyExpected)
+        if state.currentItem and itemKey(state.currentItem) == itemKeyExpected then
+          setCanvasTexts(state.currentItem)
+          if state.currentAutoHide then
+            startHideTimer(config.displaySeconds)
+          end
+        end
+        if not silent then
+          hs.alert.show("例句生成重复", 1.8)
+        end
+      end
+      return
+    end
+
+    storeAddExample(item, ex, "llm")
+    state.pending = nil
+    clearCurrentExampleLoading(itemKeyExpected)
+
+    local cur = state.currentItem
+    if cur and itemKey(cur) == itemKeyExpected then
+      local revealBack = type(opts) == "table" and opts.revealBack
+      if revealBack then
+        state.backRevealed = true
+      end
+      setCanvasTexts(cur)
+      if state.currentAutoHide then
+        startHideTimer(config.displaySeconds)
+      end
+    end
   end)
 end
 
@@ -1555,11 +2104,91 @@ function M.showNext()
   requestGenerate(requestId, desiredType, desiredCategory, 1, {})
 end
 
+function M.generateExampleForCurrent(opts)
+  if type(opts) ~= "table" then
+    opts = {}
+  end
+  local item = state.currentItem
+  if type(item) ~= "table" then
+    return
+  end
+
+  local front = item.front or ""
+  local isLikelyWord = item.type == "word" or (#front <= 20 and not front:find("%s"))
+  if not isLikelyWord then
+    return
+  end
+
+  if not llmEnabled() then
+    if not opts.silent then
+      hs.alert.show("请先在菜单栏 EN → 设置… 配置 LLM", 2.2)
+    end
+    return
+  end
+
+  local forceNew = opts.forceNew
+  if forceNew == nil then
+    forceNew = true
+  end
+  if not forceNew and storeLatestExample(item) then
+    return
+  end
+
+  cancelPending()
+  local requestId = (state.pending and state.pending.id or 0) + 1
+  local key = itemKey(item)
+  state.pending = { id = requestId, kind = "example", itemKey = key }
+
+  local revealBack = opts.revealBack
+  if revealBack == nil then
+    revealBack = forceNew
+  end
+  local silent = opts.silent and true or false
+
+  if revealBack then
+    state.backRevealed = true
+  end
+
+  item.meta = item.meta or {}
+  item.meta._transient = item.meta._transient or {}
+  item.meta._transient.exampleLoading = true
+  setCanvasTexts(item)
+
+  if state.currentAutoHide then
+    stopHideTimer()
+  end
+
+  state.pending.timeoutTimer = hs.timer.doAfter(tonumber(config.llm.timeoutSeconds) or 8, function()
+    if not state.pending or state.pending.id ~= requestId then
+      return
+    end
+    state.pending = nil
+    clearCurrentExampleLoading(key)
+    local cur = state.currentItem
+    if cur and itemKey(cur) == key then
+      setCanvasTexts(cur)
+      if state.currentAutoHide then
+        startHideTimer(config.displaySeconds)
+      end
+    end
+    if not silent then
+      hs.alert.show("例句生成超时", 1.8)
+    end
+  end)
+
+  local baseItem = cloneItem(item)
+  baseItem.meta = sanitizeMeta(baseItem.meta)
+  requestExample(requestId, baseItem, 1, {}, { revealBack = revealBack, silent = silent })
+end
+
 function M.startTimer()
   if state.intervalTimer then
     return
   end
   state.intervalTimer = hs.timer.doEvery(config.intervalSeconds, function()
+    if state.dndEnabled or state.reviewMode then
+      return
+    end
     M.showNext()
   end)
   log("timer started")
@@ -1584,6 +2213,365 @@ function M.toggleTimer()
   end
 end
 
+local function computeStats()
+  ensureStoreLoaded()
+  local stats = {
+    words = 0,
+    sentences = 0,
+    totalSeen = 0,
+    examples = 0,
+  }
+
+  for _, rec in ipairs(state.store.items or {}) do
+    local seen = tonumber(rec.seenCount) or 0
+    stats.totalSeen = stats.totalSeen + seen
+    if rec.type == "word" then
+      stats.words = stats.words + 1
+    elseif rec.type == "sentence" then
+      stats.sentences = stats.sentences + 1
+    end
+    if type(rec.examples) == "table" then
+      stats.examples = stats.examples + #rec.examples
+    end
+  end
+
+  stats.newWordStreak = tonumber(state.newWordStreak) or 0
+  return stats
+end
+
+function M.showStats()
+  local s = computeStats()
+  local lines = {
+    ("已学单词: %d"):format(s.words),
+    ("已学句子: %d"):format(s.sentences),
+    ("累计复习: %d"):format(s.totalSeen),
+    ("例句数: %d"):format(s.examples),
+  }
+  hs.alert.show(table.concat(lines, "\n"), 3.0)
+end
+
+function M.setDndEnabled(enabled)
+  state.dndEnabled = enabled and true or false
+  hs.settings.set(SETTINGS_KEYS.dnd, state.dndEnabled)
+end
+
+function M.toggleDnd()
+  M.setDndEnabled(not state.dndEnabled)
+  hs.alert.show(state.dndEnabled and "勿扰模式：已开启" or "勿扰模式：已关闭", 1.8)
+end
+
+function M.reviewNext()
+  local item = storePickReviewWord()
+  if not item then
+    hs.alert.show("暂无可复习旧词", 2.0)
+    return
+  end
+  M.show(item, { autoHide = false })
+  if llmEnabled() and item.type == "word" and not storeLatestExample(item) then
+    hs.timer.doAfter(0.05, function()
+      if state.currentItem and itemKey(state.currentItem) == itemKey(item) then
+        M.generateExampleForCurrent({ forceNew = false, revealBack = false, silent = true })
+      end
+    end)
+  end
+end
+
+function M.startReview()
+  state.reviewMode = true
+  hs.settings.set(SETTINGS_KEYS.reviewMode, true)
+  M.reviewNext()
+  hs.alert.show("复习：开始（N 下一条，Esc 退出）", 2.0)
+end
+
+function M.stopReview()
+  state.reviewMode = false
+  hs.settings.set(SETTINGS_KEYS.reviewMode, false)
+  if state.visible then
+    M.hide()
+  end
+  hs.alert.show("复习：已退出", 1.6)
+end
+
+function M.toggleReview()
+  if state.reviewMode then
+    M.stopReview()
+  else
+    M.startReview()
+  end
+end
+
+local function userConfigTable()
+  local uc = hs.settings.get(SETTINGS_KEYS.userConfig)
+  if type(uc) ~= "table" then
+    uc = {}
+  end
+  return uc
+end
+
+local function setNestedValue(tbl, path, value)
+  if type(tbl) ~= "table" or type(path) ~= "table" or #path == 0 then
+    return
+  end
+  local cur = tbl
+  for i = 1, #path - 1 do
+    local k = path[i]
+    if type(cur[k]) ~= "table" then
+      cur[k] = {}
+    end
+    cur = cur[k]
+  end
+  cur[path[#path]] = value
+end
+
+local function persistConfigValue(path, value)
+  local uc = userConfigTable()
+  setNestedValue(uc, path, value)
+  hs.settings.set(SETTINGS_KEYS.userConfig, uc)
+  setNestedValue(config, path, value)
+end
+
+local function safeNumber(v)
+  if type(v) == "number" then
+    return v
+  end
+  if type(v) == "string" then
+    return tonumber(v)
+  end
+  return nil
+end
+
+local function promptText(title, message, defaultValue)
+  local ok, button, text = pcall(hs.dialog.textPrompt, title, message, defaultValue or "", "OK", "Cancel")
+  if not ok then
+    return nil
+  end
+  if button ~= "OK" then
+    return nil
+  end
+  if type(text) ~= "string" then
+    return nil
+  end
+  return text
+end
+
+local function promptNumber(title, message, defaultNumber)
+  local defaultStr = ""
+  if defaultNumber ~= nil then
+    defaultStr = tostring(defaultNumber)
+  end
+  local text = promptText(title, message, defaultStr)
+  if text == nil then
+    return nil
+  end
+  local n = safeNumber(trim(text))
+  if not n then
+    hs.alert.show("请输入数字", 1.6)
+    return nil
+  end
+  return n
+end
+
+local function maskSecret(v)
+  if type(v) ~= "string" or v == "" then
+    return "(未设置)"
+  end
+  return "(已设置)"
+end
+
+local function summarizePath(v)
+  if type(v) ~= "string" then
+    return ""
+  end
+  v = trim(v)
+  if #v <= 48 then
+    return v
+  end
+  return v:sub(1, 18) .. " … " .. v:sub(-24)
+end
+
+local function buildSettingsChoices()
+  local llm = config.llm or {}
+  local prefs = llm.preferences or {}
+  local gen = llm.generate or {}
+
+  local intervalMinutes = math.floor((tonumber(config.intervalSeconds) or 0) / 60 + 0.5)
+
+  return {
+    { id = "__group_llm", text = "—— LLM ——", subText = "配置后即可生成/补全" },
+    { id = "llm_enabled", text = "LLM：启用/禁用", subText = llm.enabled and "已启用" or "未启用" },
+    { id = "llm_protocol", text = "LLM：协议 (openai/simple)", subText = llm.protocol or "simple" },
+    { id = "llm_mode", text = "LLM：模式 (generate/enrich)", subText = llm.mode or "generate" },
+    { id = "llm_endpoint", text = "LLM：Endpoint", subText = summarizePath(llm.endpoint) },
+    { id = "llm_model", text = "LLM：Model（openai 协议必填）", subText = llm.model or "" },
+    { id = "llm_apiKey", text = "LLM：API Key", subText = maskSecret(llm.apiKey) .. " / env: " .. (llm.apiKeyEnv or "") },
+    { id = "llm_timeout", text = "LLM：超时秒数", subText = tostring(llm.timeoutSeconds or 8) },
+    { id = "llm_temperature", text = "LLM：temperature", subText = tostring(llm.temperature or 0.2) },
+    { id = "llm_maxTokens", text = "LLM：maxTokens", subText = tostring(llm.maxTokens or "") },
+    { id = "pref_language", text = "偏好：中文/英文解释", subText = prefs.language or "zh" },
+    { id = "pref_style", text = "偏好：风格", subText = prefs.style or "concise" },
+    { id = "pref_includeExample", text = "偏好：在 back 里包含例句", subText = (prefs.includeExample == false) and "否" or "是" },
+    { id = "__group_timer", text = "—— 定时与弹窗 ——", subText = "" },
+    { id = "intervalMinutes", text = "定时：间隔（分钟）", subText = tostring(intervalMinutes) },
+    { id = "displaySeconds", text = "弹窗：停留（秒）", subText = tostring(config.displaySeconds or 8) },
+    { id = "showBackByDefault", text = "弹窗：默认显示答案", subText = config.showBackByDefault and "是" or "否" },
+    { id = "autoStart", text = "启动：自动开启定时弹出", subText = config.autoStart and "是" or "否" },
+    { id = "newWordsBeforeReview", text = "复习：每 N 个新词插入 1 个旧词", subText = tostring(gen.newWordsBeforeReview or 3) },
+    { id = "__group_misc", text = "—— 其它 ——", subText = "" },
+    { id = "reloadConfig", text = "Reload Config", subText = "重载 Hammerspoon 配置" },
+  }
+end
+
+local function handleSettingsChoice(id)
+  if id:match("^__group_") then
+    return true
+  end
+  if id == "llm_enabled" then
+    persistConfigValue({ "llm", "enabled" }, not (config.llm and config.llm.enabled))
+    return true
+  end
+  if id == "llm_protocol" then
+    local cur = (config.llm and config.llm.protocol) or "simple"
+    local next = (cur == "openai") and "simple" or "openai"
+    persistConfigValue({ "llm", "protocol" }, next)
+    return true
+  end
+  if id == "llm_mode" then
+    local cur = (config.llm and config.llm.mode) or "generate"
+    local next = (cur == "generate") and "enrich" or "generate"
+    persistConfigValue({ "llm", "mode" }, next)
+    return true
+  end
+  if id == "llm_endpoint" then
+    local v = promptText("LLM Endpoint", "例如：http://127.0.0.1:1234/v1/chat/completions", (config.llm and config.llm.endpoint) or "")
+    if v then
+      persistConfigValue({ "llm", "endpoint" }, trim(v))
+    end
+    return true
+  end
+  if id == "llm_model" then
+    local v = promptText("LLM Model", "openai 协议必填，例如：gpt-4o-mini / llama3", (config.llm and config.llm.model) or "")
+    if v then
+      persistConfigValue({ "llm", "model" }, trim(v))
+    end
+    return true
+  end
+  if id == "llm_apiKey" then
+    local v = promptText("LLM API Key", "留空表示使用环境变量（例如 OPENAI_API_KEY）", (config.llm and config.llm.apiKey) or "")
+    if v ~= nil then
+      persistConfigValue({ "llm", "apiKey" }, trim(v))
+    end
+    return true
+  end
+  if id == "llm_timeout" then
+    local n = promptNumber("LLM 超时（秒）", "建议 8~20", (config.llm and config.llm.timeoutSeconds) or 8)
+    if n then
+      persistConfigValue({ "llm", "timeoutSeconds" }, math.max(1, math.floor(n)))
+    end
+    return true
+  end
+  if id == "llm_temperature" then
+    local n = promptNumber("LLM temperature", "建议 0.0~1.0", (config.llm and config.llm.temperature) or 0.2)
+    if n then
+      persistConfigValue({ "llm", "temperature" }, n)
+    end
+    return true
+  end
+  if id == "llm_maxTokens" then
+    local n = promptNumber("LLM maxTokens", "建议 200~600（视模型而定）", (config.llm and config.llm.maxTokens) or 280)
+    if n then
+      persistConfigValue({ "llm", "maxTokens" }, math.floor(n))
+    end
+    return true
+  end
+  if id == "pref_language" then
+    local cur = (config.llm and config.llm.preferences and config.llm.preferences.language) or "zh"
+    local next = (cur == "zh") and "en" or "zh"
+    persistConfigValue({ "llm", "preferences", "language" }, next)
+    return true
+  end
+  if id == "pref_style" then
+    local v = promptText("风格", "例如：concise / detailed", (config.llm and config.llm.preferences and config.llm.preferences.style) or "concise")
+    if v then
+      persistConfigValue({ "llm", "preferences", "style" }, trim(v))
+    end
+    return true
+  end
+  if id == "pref_includeExample" then
+    local cur = (config.llm and config.llm.preferences and config.llm.preferences.includeExample)
+    persistConfigValue({ "llm", "preferences", "includeExample" }, cur == false)
+    return true
+  end
+  if id == "intervalMinutes" then
+    local curMin = (tonumber(config.intervalSeconds) or 0) / 60
+    local n = promptNumber("间隔（分钟）", "例如：20", math.floor(curMin + 0.5))
+    if n then
+      local seconds = math.max(10, math.floor(n * 60))
+      persistConfigValue({ "intervalSeconds" }, seconds)
+      if state.intervalTimer then
+        M.stopTimer()
+        if not state.dndEnabled and not state.reviewMode then
+          M.startTimer()
+        end
+      end
+    end
+    return true
+  end
+  if id == "displaySeconds" then
+    local n = promptNumber("停留（秒）", "例如：8", tonumber(config.displaySeconds) or 8)
+    if n then
+      persistConfigValue({ "displaySeconds" }, math.max(1, math.floor(n)))
+    end
+    return true
+  end
+  if id == "showBackByDefault" then
+    persistConfigValue({ "showBackByDefault" }, not config.showBackByDefault)
+    return true
+  end
+  if id == "autoStart" then
+    persistConfigValue({ "autoStart" }, not config.autoStart)
+    return true
+  end
+  if id == "newWordsBeforeReview" then
+    local cur = (config.llm and config.llm.generate and config.llm.generate.newWordsBeforeReview) or 3
+    local n = promptNumber("每 N 个新词插入 1 个旧词", "例如：3", cur)
+    if n then
+      persistConfigValue({ "llm", "generate", "newWordsBeforeReview" }, math.max(0, math.floor(n)))
+    end
+    return true
+  end
+  if id == "reloadConfig" then
+    hs.reload()
+    return false
+  end
+  return false
+end
+
+function M.openSettings()
+  if not state.settingsController then
+    local chooser = hs.chooser.new(function(choice)
+      if not choice then
+        return
+      end
+      local id = choice.id
+      if type(id) ~= "string" or id == "" then
+        return
+      end
+      local reopen = handleSettingsChoice(id)
+      if reopen then
+        hs.timer.doAfter(0.05, function()
+          M.openSettings()
+        end)
+      end
+    end)
+    chooser:searchSubText(true)
+    chooser:width(48)
+    state.settingsController = chooser
+  end
+
+  state.settingsController:choices(buildSettingsChoices())
+  state.settingsController:show()
+end
+
 function M.reload()
   loadAllSources()
   if state.storeSaveTimer then
@@ -1600,7 +2588,7 @@ end
 
 local function bindHotkeys()
   hs.hotkey.bind(config.hotkeys.showNow[1], config.hotkeys.showNow[2], function()
-    M.showNext()
+    M.showNext({ manual = true })
   end)
   hs.hotkey.bind(config.hotkeys.toggleTimer[1], config.hotkeys.toggleTimer[2], function()
     M.toggleTimer()
@@ -1610,13 +2598,89 @@ local function bindHotkeys()
   end)
 end
 
+local function setupMenuBar()
+  if state.menuBar then
+    return
+  end
+  local mb = hs.menubar.new()
+  if not mb then
+    return
+  end
+  mb:setTitle("EN")
+  mb:setTooltip("Vocab Overlay")
+  mb:setMenu(function()
+    local timerOn = state.intervalTimer ~= nil
+    local stats = computeStats()
+    local summary = ("已学 %d 词 / %d 句 · 复习 %d · 例句 %d"):format(
+      stats.words,
+      stats.sentences,
+      stats.totalSeen,
+      stats.examples
+    )
+
+    return {
+      { title = summary, disabled = true },
+      { title = ("新词连击: %d"):format(stats.newWordStreak or 0), disabled = true },
+      { title = "-" },
+      { title = "现在弹出", fn = function()
+        M.showNext({ manual = true })
+      end },
+      { title = timerOn and "暂停定时弹出" or "开启定时弹出", fn = function()
+        M.toggleTimer()
+      end },
+      { title = "勿扰模式", checked = state.dndEnabled and true or false, fn = function()
+        M.toggleDnd()
+      end },
+      { title = "复习模式", checked = state.reviewMode and true or false, fn = function()
+        M.toggleReview()
+      end },
+      { title = "查看统计", fn = function()
+        M.showStats()
+      end },
+      { title = "-" },
+      { title = "设置…", fn = function()
+        if M.openSettings then
+          M.openSettings()
+        else
+          hs.alert.show("设置界面未初始化", 1.6)
+        end
+      end },
+      { title = "Reload Config", fn = function()
+        hs.reload()
+      end },
+    }
+  end)
+  state.menuBar = mb
+end
+
 local function setupModal()
   state.modal = hs.hotkey.modal.new(nil, nil)
   state.modal:bind({}, "escape", function()
+    if state.reviewMode and M.stopReview then
+      M.stopReview()
+      return
+    end
     M.hide()
   end)
   state.modal:bind({}, "space", function()
     M.toggleBack()
+  end)
+  state.modal:bind({}, "n", function()
+    if state.reviewMode and M.reviewNext then
+      M.reviewNext()
+      return
+    end
+    M.showNext({ manual = true })
+  end)
+  state.modal:bind({}, "e", function()
+    if M.generateExampleForCurrent then
+      M.generateExampleForCurrent({ manual = true })
+    end
+  end)
+  state.modal:bind({}, "d", function()
+    if M.toggleDnd then
+      M.toggleDnd()
+    end
   end)
 end
 
@@ -1643,9 +2707,10 @@ function M.start()
   ensureStoreLoaded()
   setupModal()
   bindHotkeys()
+  setupMenuBar()
   watchScreens()
 
-  if config.autoStart then
+  if config.autoStart and not state.dndEnabled and not state.reviewMode then
     M.startTimer()
   end
   log("ready")
