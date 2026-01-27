@@ -100,6 +100,7 @@ local config = {
   },
 
   ui = {
+    menuBarTitle = "VO",
     overlayColor = { white = 0, alpha = 0.38 },
     cardColor = { white = 1, alpha = 0.96 },
     cardStrokeColor = { white = 0, alpha = 0.08 },
@@ -2621,9 +2622,11 @@ local function setupMenuBar()
   end
   local mb = hs.menubar.new()
   if not mb then
+    log("menubar creation failed")
+    hs.alert.show("vocab_overlay：无法创建菜单栏按钮", 2.5)
     return
   end
-  mb:setTitle("EN")
+  mb:setTitle((config.ui and config.ui.menuBarTitle) or "VO")
   mb:setTooltip("Vocab Overlay")
   mb:setMenu(function()
     local timerOn = state.intervalTimer ~= nil
@@ -2668,6 +2671,11 @@ local function setupMenuBar()
     }
   end)
   state.menuBar = mb
+
+  if not hs.settings.get("vocabOverlay._firstRunShown") then
+    hs.settings.set("vocabOverlay._firstRunShown", true)
+    hs.alert.show("VO 已启动：点菜单栏 VO → 设置… / 现在弹出", 3.0)
+  end
 end
 
 local function setupModal()
