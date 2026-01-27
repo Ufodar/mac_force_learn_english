@@ -94,6 +94,7 @@ llm = {
 ## 4) 使用与快捷键
 
 Reload 后，菜单栏会出现 **VO**（Vocab Overlay）。
+如果你的菜单栏太挤（刘海屏/多图标/Bartender/Hidden Bar），图标可能被隐藏：可以直接在终端运行 `open 'hammerspoon://vo'` 打开控制面板。
 
 - 菜单栏 **VO**：
   - **设置…**：配置 LLM / 定时 / 复习插入规则

@@ -100,8 +100,8 @@ local config = {
   },
 
   ui = {
-    menuBarTitle = "", -- keep empty to use icon-only (more likely to fit in a crowded menubar)
-    menuBarHighlightSeconds = 6,
+    menuBarTitle = "VO",
+    menuBarHighlightSeconds = 15,
     overlayColor = { white = 0, alpha = 0.38 },
     cardColor = { white = 1, alpha = 0.96 },
     cardStrokeColor = { white = 0, alpha = 0.08 },
@@ -2588,6 +2588,60 @@ function M.openSettings()
   state.settingsController:show()
 end
 
+local function buildCommandChoices()
+  local timerOn = state.intervalTimer ~= nil
+  local stats = computeStats()
+  local summary = ("已学 %d 词 / %d 句 · 复习 %d · 例句 %d"):format(
+    stats.words,
+    stats.sentences,
+    stats.totalSeen,
+    stats.examples
+  )
+
+  return {
+    { id = "__summary", text = "Vocab Overlay", subText = summary },
+    { id = "showNow", text = "现在弹出", subText = "立刻显示下一条" },
+    { id = "toggleTimer", text = timerOn and "暂停定时弹出" or "开启定时弹出", subText = "" },
+    { id = "toggleDnd", text = state.dndEnabled and "关闭勿扰模式" or "开启勿扰模式", subText = "" },
+    { id = "toggleReview", text = state.reviewMode and "退出复习模式" or "进入复习模式", subText = "" },
+    { id = "settings", text = "设置…", subText = "配置 LLM / 定时 / 复习规则" },
+    { id = "stats", text = "查看统计", subText = "" },
+    { id = "reload", text = "Reload Config", subText = "" },
+  }
+end
+
+function M.openCommandPalette()
+  if not state.commandController then
+    local chooser = hs.chooser.new(function(choice)
+      if not choice or type(choice.id) ~= "string" then
+        return
+      end
+      local id = choice.id
+      if id == "showNow" then
+        M.showNext({ manual = true })
+      elseif id == "toggleTimer" then
+        M.toggleTimer()
+      elseif id == "toggleDnd" then
+        M.toggleDnd()
+      elseif id == "toggleReview" then
+        M.toggleReview()
+      elseif id == "settings" then
+        M.openSettings()
+      elseif id == "stats" then
+        M.showStats()
+      elseif id == "reload" then
+        hs.reload()
+      end
+    end)
+    chooser:searchSubText(true)
+    chooser:width(46)
+    state.commandController = chooser
+  end
+
+  state.commandController:choices(buildCommandChoices())
+  state.commandController:show()
+end
+
 function M.reload()
   loadAllSources()
   if state.storeSaveTimer then
@@ -2690,6 +2744,16 @@ local function setupMenuBar()
   end)
   state.menuBar = mb
 
+  local f = nil
+  pcall(function()
+    f = state.menuBar:frame()
+  end)
+  if f then
+    log(("menubar item created at x=%.0f y=%.0f w=%.0f h=%.0f"):format(f.x, f.y, f.w, f.h))
+  else
+    log("menubar item created but frame=nil (may be hidden)")
+  end
+
   local function highlightMenuBarOnce()
     local seconds = (config.ui and tonumber(config.ui.menuBarHighlightSeconds)) or 0
     if seconds <= 0 then
@@ -2701,7 +2765,12 @@ local function setupMenuBar()
       end
       local frame = state.menuBar:frame()
       if not frame then
-        hs.alert.show("VO：菜单栏按钮可能被隐藏（菜单栏太满 / Bartender/Hidden Bar）\n我已自动打开设置", 6.0)
+        hs.alert.show("VO：菜单栏按钮可能被隐藏（菜单栏太满 / Bartender/Hidden Bar）\n我已自动打开控制面板/设置", 8.0)
+        if M.openCommandPalette then
+          hs.timer.doAfter(0.05, function()
+            M.openCommandPalette()
+          end)
+        end
         if M.openSettings then
           hs.timer.doAfter(0.1, function()
             M.openSettings()
@@ -2731,8 +2800,13 @@ local function setupMenuBar()
 
   if not hs.settings.get("vocabOverlay._firstRunShown") then
     hs.settings.set("vocabOverlay._firstRunShown", true)
-    hs.alert.show("VO 已启动：点菜单栏右上角小图标 → 设置… / 现在弹出", 6.0)
+    hs.alert.show("VO 已启动：点菜单栏 VO → 设置… / 现在弹出（找不到就会自动弹出控制面板）", 10.0)
     highlightMenuBarOnce()
+    if M.openCommandPalette then
+      hs.timer.doAfter(0.2, function()
+        M.openCommandPalette()
+      end)
+    end
   else
     -- If user still can't find the icon, highlight it after reload as well.
     if not hs.settings.get("vocabOverlay._highlightedOnce") then
@@ -2786,6 +2860,28 @@ function M.start()
     return
   end
   state.initialized = true
+
+  -- Enable `hs -c '...'` CLI (requires hs.ipc to be loaded).
+  pcall(function()
+    require("hs.ipc")
+  end)
+
+  -- Fallback entrypoints if the menubar item is hidden: `open 'hammerspoon://vo'`
+  pcall(function()
+    hs.urlevent.bind("vo", function()
+      if M.openCommandPalette then
+        M.openCommandPalette()
+      end
+    end)
+    hs.urlevent.bind("vo-settings", function()
+      if M.openSettings then
+        M.openSettings()
+      end
+    end)
+    hs.urlevent.bind("vo-show", function()
+      M.showNext({ manual = true })
+    end)
+  end)
 
   if config.hideDockIcon and hs.dockicon and hs.dockicon.hide then
     hs.dockicon.hide()
