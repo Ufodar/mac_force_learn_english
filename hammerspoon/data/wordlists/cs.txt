@@ -1,9 +1,4 @@
-# Computer / programming
-
-algorithm
-compile
-debug
-recursion
-concurrency
-database
-
+# Computer / programming wordlist
+# One word per line. Optional meaning formats:
+# algorithm\t算法
+# algorithm || 算法

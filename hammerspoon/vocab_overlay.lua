@@ -758,6 +758,15 @@ local function storeMarkSeen(item, source)
     storeAddExample(item, extracted, source)
   end
 
+  -- If the item's back contains IPA, persist it into meta for future display.
+  local phonetic = extractPhoneticFromBack(item.back)
+  if phonetic and phonetic ~= "" then
+    rec.meta = rec.meta or {}
+    if type(rec.meta.phonetic) ~= "string" or trim(rec.meta.phonetic) == "" then
+      rec.meta.phonetic = phonetic
+    end
+  end
+
   scheduleStoreSave()
   return rec
 end
@@ -912,6 +921,44 @@ local function backAlreadyContainsExample(back)
   return back:find("[Ee]xample[:：]") ~= nil or back:find("例句[:：]") ~= nil
 end
 
+local function backAlreadyContainsPhonetic(back)
+  if type(back) ~= "string" then
+    return false
+  end
+  return back:find("IPA%s*[:：]") ~= nil or back:find("音标%s*[:：]") ~= nil
+end
+
+local function normalizePhonetic(raw)
+  if type(raw) ~= "string" then
+    return nil
+  end
+  local s = trim(raw):gsub("%s+", " ")
+  if s == "" then
+    return nil
+  end
+  local first = s:sub(1, 1)
+  local last = s:sub(-1)
+  if (first == "/" and last == "/") or (first == "[" and last == "]") then
+    return s
+  end
+  -- If it already looks like IPA with slashes somewhere, keep it.
+  if s:find("/") then
+    return s
+  end
+  return "/" .. s .. "/"
+end
+
+local function extractPhoneticFromBack(back)
+  if type(back) ~= "string" or back == "" then
+    return nil
+  end
+  local p = back:match("IPA%s*[:：]%s*(.-)\n") or back:match("音标%s*[:：]%s*(.-)\n")
+  if not p then
+    p = back:match("IPA%s*[:：]%s*(.+)$") or back:match("音标%s*[:：]%s*(.+)$")
+  end
+  return normalizePhonetic(p)
+end
+
 local function isExampleLoading(item)
   if type(item) ~= "table" then
     return false
@@ -927,9 +974,18 @@ local function buildDisplayBack(item)
   local baseBack = (type(item) == "table" and type(item.back) == "string") and trim(item.back) or ""
   local ex = storeLatestExample(item)
   local loading = isExampleLoading(item)
+  local phonetic = nil
+  if type(item) == "table" and type(item.meta) == "table" then
+    phonetic = normalizePhonetic(item.meta.phonetic or item.meta.ipa or item.meta.IPA)
+  end
+  if not phonetic then
+    phonetic = extractPhoneticFromBack(baseBack)
+  end
 
   if (not ex or (ex.zh == "" and ex.en == "")) and not loading then
-    return baseBack
+    if not phonetic or phonetic == "" then
+      return baseBack
+    end
   end
 
   if backAlreadyContainsExample(baseBack) then
@@ -937,6 +993,9 @@ local function buildDisplayBack(item)
   end
 
   local parts = {}
+  if phonetic and not backAlreadyContainsPhonetic(baseBack) then
+    table.insert(parts, "音标: " .. phonetic)
+  end
   if baseBack ~= "" then
     table.insert(parts, baseBack)
   end
@@ -1642,6 +1701,7 @@ local function buildOpenAiMessages(baseItem, opts)
     "Return STRICT JSON only. No markdown. No extra text.",
     'Your JSON must be an object with key "item".',
     'Schema: {"item":{"type":"word|sentence","front":"...","back":"...","meta":{...}}}',
+    'For type="word", also include item.meta.phonetic as IPA (e.g. "/ˈælɡəˌrɪðəm/").',
     'The "front" must be English. The "back" must be in ' .. language .. ".",
     'Keep it ' .. style .. " and easy to review quickly.",
     includeExample and 'If possible, include 1 short example sentence and its ' .. language .. " translation in back." or "No example sentence is required.",
@@ -1657,6 +1717,11 @@ local function buildOpenAiMessages(baseItem, opts)
       desiredLine = "Type requirement: sentence (a short natural English sentence)."
     end
 
+    local phoneticLine = ""
+    if desiredType == "word" then
+      phoneticLine = 'Also include item.meta.phonetic as IPA (e.g. "/ˈ.../").'
+    end
+
     local categoryLine = ""
     if type(desiredCategory) == "string" and desiredCategory ~= "" then
       categoryLine = "Target category: " .. desiredCategory .. " (put it into item.meta.category)."
@@ -1670,12 +1735,13 @@ local function buildOpenAiMessages(baseItem, opts)
     userPrompt = table.concat({
       "Generate ONE item for spaced repetition.",
       desiredLine,
+      phoneticLine,
       categoryLine ~= "" and categoryLine or "Choose exactly one category from the list below, and put it into item.meta.category.",
       "Categories (id, weight): " .. (json.encode(categories) or "[]"),
       avoidLine,
       "",
       'Output JSON only. Example:',
-      '{"item":{"type":"word","front":"algorithm","back":"算法；…\\nExample: ...\\n译: ...","meta":{"category":"cs"}}}',
+      '{"item":{"type":"word","front":"algorithm","back":"算法；…\\nExample: ...\\n译: ...","meta":{"category":"cs","phonetic":"/ˈælɡəˌrɪðəm/"}}}',
     }, "\n")
   else
     local input = {
@@ -1687,10 +1753,11 @@ local function buildOpenAiMessages(baseItem, opts)
     userPrompt = table.concat({
       "Enrich the following item for quick memorization.",
       'Keep item.front unchanged. Put meaning/notes into item.back.',
+      'If type is "word", also include item.meta.phonetic as IPA (e.g. "/ˈ.../").',
       "Input: " .. (json.encode(input) or "{}"),
       "",
       'Output JSON only. Example:',
-      '{"item":{"type":"word","front":"algorithm","back":"算法；…\\nExample: ...\\n译: ...","meta":{"category":"cs"}}}',
+      '{"item":{"type":"word","front":"algorithm","back":"算法；…\\nExample: ...\\n译: ...","meta":{"category":"cs","phonetic":"/ˈælɡəˌrɪðəm/"}}}',
     }, "\n")
   end
 

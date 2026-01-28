@@ -1,9 +1,4 @@
-# CET-6 (sample)
-
-dilemma
-inevitable
-rigorous
-sophisticated
-substantial
-virtually
-
+# CET-6 wordlist (empty by default)
+# One word per line. Optional meaning formats:
+# dilemma\t两难；困境
+# dilemma || 两难；困境

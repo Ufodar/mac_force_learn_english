@@ -1,9 +1,4 @@
-# High school basic (sample)
-
-admire
-approach
-benefit
-challenge
-confirm
-describe
-
+# Gaokao 3500 wordlist (empty by default)
+# One word per line. Optional meaning formats:
+# admire\t钦佩；赞赏
+# admire || 钦佩；赞赏

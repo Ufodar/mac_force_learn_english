@@ -1,9 +1,4 @@
-# CET-4 (sample)
-
-accomplish
-average
-convenient
-evidence
-occasion
-positive
-
+# CET-4 wordlist (empty by default)
+# One word per line. Optional meaning formats:
+# accomplish\t完成；实现
+# accomplish || 完成；实现
