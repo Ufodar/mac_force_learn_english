@@ -81,6 +81,8 @@ llm = {
 
 生成出来的内容会自动保存到：`~/.hammerspoon/data/generated_store.json`（包含已生成的词/句、复习次数、例句历史），并且会按 `newWordsBeforeReview` 规则穿插复习旧词（默认每 3 个新词插入 1 个旧词复习，可在菜单栏设置里改）。
 
+> 单词会尽量包含音标（IPA）：优先读取 `item.meta.phonetic`，或从 `back` 里的 `IPA:`/`音标:` 行自动提取。
+
 ### `protocol = "simple"`（你想自定义接口时）
 
 你也可以自己写一个接口，例如 `endpoint = "http://127.0.0.1:3000/vocab"`，脚本发出的请求（示意）：
