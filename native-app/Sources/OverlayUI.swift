@@ -14,6 +14,14 @@ final class OverlayView: NSView {
     var onGenerateExample: (() -> Void)?
     var onToggleDND: (() -> Void)?
 
+    private func applyCardColors() {
+        // Note: converting dynamic system colors to CGColor freezes them; refresh on appearance changes.
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            card.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
+            card.layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+    }
+
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
 
@@ -21,10 +29,9 @@ final class OverlayView: NSView {
         layer?.backgroundColor = NSColor.black.withAlphaComponent(0.55).cgColor
 
         card.wantsLayer = true
-        card.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.92).cgColor
         card.layer?.cornerRadius = 14
         card.layer?.borderWidth = 1
-        card.layer?.borderColor = NSColor.separatorColor.cgColor
+        applyCardColors()
 
         titleLabel.font = NSFont.systemFont(ofSize: 30, weight: .semibold)
         titleLabel.alignment = .center
@@ -80,6 +87,11 @@ final class OverlayView: NSView {
     required init?(coder: NSCoder) { nil }
 
     override var acceptsFirstResponder: Bool { true }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyCardColors()
+    }
 
     func render(item: VocabItem, showBack: Bool, dnd: Bool) {
         titleLabel.stringValue = item.front
