@@ -9,6 +9,8 @@ final class QuickTranslateController {
     private var hideWorkItem: DispatchWorkItem?
     private var currentTask: Task<Void, Never>?
     private var pollTimer: Timer?
+    private var eventTap: CFMachPort?
+    private var eventTapSource: CFRunLoopSource?
 
     private var lastText: String = ""
     private var pendingPollText: String = ""
@@ -32,7 +34,7 @@ final class QuickTranslateController {
         p.backgroundColor = .clear
         p.hasShadow = true
         p.hidesOnDeactivate = false
-        p.level = .floating
+        p.level = .statusBar
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         p.ignoresMouseEvents = false
         p.isMovableByWindowBackground = false
@@ -60,6 +62,8 @@ final class QuickTranslateController {
         requestAccessibilityPromptIfNeeded()
         requestInputMonitoringPromptIfNeeded()
 
+        setupEventTapIfPossible()
+
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             self?.scheduleCheck()
         }
@@ -84,6 +88,7 @@ final class QuickTranslateController {
         currentTask = nil
         pollTimer?.invalidate()
         pollTimer = nil
+        tearDownEventTap()
         hide()
     }
 
@@ -271,6 +276,7 @@ final class QuickTranslateController {
 
     private func fetchSelectedTextViaCopyPreservingClipboard() -> String? {
         guard AXIsProcessTrusted() else { return nil }
+        guard CGPreflightListenEventAccess() else { return nil }
 
         let pb = NSPasteboard.general
         let snapshot = PasteboardSnapshot.capture(from: pb)
@@ -299,12 +305,14 @@ final class QuickTranslateController {
     }
 
     private func requestAccessibilityPromptIfNeeded() {
+        if AXIsProcessTrusted() { return }
         let key = kAXTrustedCheckOptionPrompt.takeRetainedValue() as String
         let options = [key: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
     }
 
     private func requestInputMonitoringPromptIfNeeded() {
+        if CGPreflightListenEventAccess() { return }
         _ = CGRequestListenEventAccess()
     }
 
@@ -312,6 +320,59 @@ final class QuickTranslateController {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "" }
         return trimmed.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    }
+
+    private func setupEventTapIfPossible() {
+        guard eventTap == nil else { return }
+
+        let mask = (1 << CGEventType.leftMouseUp.rawValue)
+        let callback: CGEventTapCallBack = { _, type, event, refcon in
+            guard let refcon else { return Unmanaged.passUnretained(event) }
+            let controller = Unmanaged<QuickTranslateController>.fromOpaque(refcon).takeUnretainedValue()
+
+            if type == .tapDisabledByTimeout || type == .tapDisabledByUserInput {
+                if let tap = controller.eventTap {
+                    CGEvent.tapEnable(tap: tap, enable: true)
+                }
+                return Unmanaged.passUnretained(event)
+            }
+
+            if type == .leftMouseUp {
+                DispatchQueue.main.async {
+                    controller.scheduleCheck()
+                }
+            }
+            return Unmanaged.passUnretained(event)
+        }
+
+        guard let tap = CGEvent.tapCreate(
+            tap: .cgSessionEventTap,
+            place: .headInsertEventTap,
+            options: .listenOnly,
+            eventsOfInterest: CGEventMask(mask),
+            callback: callback,
+            userInfo: Unmanaged.passUnretained(self).toOpaque()
+        ) else {
+            return
+        }
+
+        let source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, tap, 0)
+        CFRunLoopAddSource(CFRunLoopGetMain(), source, .commonModes)
+        CGEvent.tapEnable(tap: tap, enable: true)
+
+        eventTap = tap
+        eventTapSource = source
+    }
+
+    private func tearDownEventTap() {
+        if let source = eventTapSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), source, .commonModes)
+        }
+        eventTapSource = nil
+        if let tap = eventTap {
+            CFMachPortInvalidate(tap)
+        }
+        eventTap = nil
     }
 
     private func containsCJK(_ text: String) -> Bool {
