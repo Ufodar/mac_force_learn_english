@@ -78,7 +78,7 @@ final class AppConfig {
 
     /// "en" | "zh" | "auto"
     var quickTranslateTarget: String {
-        get { defaults.string(forKey: "quickTranslate.target") ?? "en" }
+        get { defaults.string(forKey: "quickTranslate.target") ?? "auto" }
         set { defaults.set(newValue, forKey: "quickTranslate.target") }
     }
 

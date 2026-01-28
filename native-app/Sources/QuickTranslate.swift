@@ -1,4 +1,5 @@
 import ApplicationServices
+import Carbon.HIToolbox
 import Cocoa
 
 @MainActor
@@ -55,6 +56,7 @@ final class QuickTranslateController {
         guard mouseMonitor == nil else { return }
 
         requestAccessibilityPromptIfNeeded()
+        requestInputMonitoringPromptIfNeeded()
 
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             self?.scheduleCheck()
@@ -163,16 +165,19 @@ final class QuickTranslateController {
     }
 
     private func isReasonable(_ text: String) -> Bool {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = normalizeText(text)
         if trimmed.isEmpty { return false }
-        if trimmed.count > 80 { return false }
-        if trimmed.contains("\n") { return false }
+        if trimmed.count > 200 { return false }
         return true
     }
 
     private func fetchSelectedText() -> String? {
         if let s = fetchSelectedTextViaAccessibility() {
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+            let t = normalizeText(s)
+            return t.isEmpty ? nil : t
+        }
+        if let s = fetchSelectedTextViaCopyPreservingClipboard() {
+            let t = normalizeText(s)
             return t.isEmpty ? nil : t
         }
         return nil
@@ -192,10 +197,78 @@ final class QuickTranslateController {
         return nil
     }
 
+    private struct PasteboardSnapshot {
+        var items: [[String: Data]]
+
+        static func capture(from pb: NSPasteboard) -> PasteboardSnapshot {
+            let items: [[String: Data]] = pb.pasteboardItems?.map { item in
+                var dict: [String: Data] = [:]
+                for t in item.types {
+                    if let data = item.data(forType: t) {
+                        dict[t.rawValue] = data
+                    }
+                }
+                return dict
+            } ?? []
+            return PasteboardSnapshot(items: items)
+        }
+
+        func restore(to pb: NSPasteboard) {
+            pb.clearContents()
+            let pbItems: [NSPasteboardItem] = items.map { dict in
+                let it = NSPasteboardItem()
+                for (type, data) in dict {
+                    it.setData(data, forType: NSPasteboard.PasteboardType(type))
+                }
+                return it
+            }
+            _ = pb.writeObjects(pbItems)
+        }
+    }
+
+    private func fetchSelectedTextViaCopyPreservingClipboard() -> String? {
+        guard AXIsProcessTrusted() else { return nil }
+
+        let pb = NSPasteboard.general
+        let snapshot = PasteboardSnapshot.capture(from: pb)
+        let before = pb.changeCount
+
+        sendCopyShortcut()
+
+        for _ in 0..<14 {
+            if pb.changeCount != before { break }
+            usleep(25_000)
+        }
+
+        let text = pb.string(forType: .string)
+        snapshot.restore(to: pb)
+        return text
+    }
+
+    private func sendCopyShortcut() {
+        let src = CGEventSource(stateID: .combinedSessionState)
+        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_ANSI_C), keyDown: true)
+        keyDown?.flags = .maskCommand
+        let keyUp = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_ANSI_C), keyDown: false)
+        keyUp?.flags = .maskCommand
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
+    }
+
     private func requestAccessibilityPromptIfNeeded() {
         let key = kAXTrustedCheckOptionPrompt.takeRetainedValue() as String
         let options = [key: true] as CFDictionary
         _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func requestInputMonitoringPromptIfNeeded() {
+        _ = CGRequestListenEventAccess()
+    }
+
+    private func normalizeText(_ text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "" }
+        return trimmed.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
     }
 
     private func containsCJK(_ text: String) -> Bool {

@@ -201,8 +201,19 @@ final class LLMClient {
 
     private func requestLLM(prompt: String, attempt: Int) async throws -> String {
         let endpoint = config.llmEndpointEffective
-        guard let url = URL(string: endpoint) else { throw LLMError.invalidURL(endpoint) }
+        guard let primaryURL = URL(string: endpoint) else { throw LLMError.invalidURL(endpoint) }
 
+        do {
+            return try await requestLLM(at: primaryURL, prompt: prompt, attempt: attempt)
+        } catch let LLMError.httpError(code, _) where code == 404 || code == 405 {
+            if let altURL = alternateCompletionsURL(from: primaryURL) {
+                return try await requestLLM(at: altURL, prompt: prompt, attempt: attempt)
+            }
+            throw LLMError.httpError(code, "endpoint not found")
+        }
+    }
+
+    private func requestLLM(at url: URL, prompt: String, attempt: Int) async throws -> String {
         var request = URLRequest(url: url, timeoutInterval: 30)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -248,6 +259,19 @@ final class LLMClient {
         }
 
         return try parseOpenAIContent(from: data, url: url)
+    }
+
+    private func alternateCompletionsURL(from url: URL) -> URL? {
+        // /v1/chat/completions <-> /v1/completions
+        if url.path.hasSuffix("/chat/completions") {
+            let newPath = url.path.replacingOccurrences(of: "/chat/completions", with: "/completions")
+            return URL(string: url.absoluteString.replacingOccurrences(of: url.path, with: newPath))
+        }
+        if url.path.hasSuffix("/completions") {
+            let newPath = url.path.replacingOccurrences(of: "/completions", with: "/chat/completions")
+            return URL(string: url.absoluteString.replacingOccurrences(of: url.path, with: newPath))
+        }
+        return nil
     }
 
     private func parseOpenAIContent(from data: Data, url: URL) throws -> String {
