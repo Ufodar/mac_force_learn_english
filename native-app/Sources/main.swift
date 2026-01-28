@@ -27,7 +27,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         restartTimer()
         quickTranslate.applyConfig()
 
-        if config.llmEndpoint.isEmpty || config.llmModel.isEmpty {
+        if store.data.items.isEmpty || config.llmEndpointEffective.isEmpty || config.llmModelEffective.isEmpty {
             settingsWC.show()
         }
     }

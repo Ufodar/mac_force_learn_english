@@ -14,7 +14,7 @@ bash native-app/scripts/dist.sh
 
 产物：
 - `native-app/dist/MacForceLearnEnglish.dmg`
-- `native-app/dist/MacForceLearnEnglish.app`（同目录也会输出一个便于本地直接打开的 app）
+- `native-app/build/MacForceLearnEnglish.app`
 
 ## 安装（未签名/未公证）
 

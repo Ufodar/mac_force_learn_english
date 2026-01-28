@@ -36,8 +36,8 @@ final class LLMClient {
 
     func generateItem(existingDedupeKeys: Set<String>) async throws -> VocabItem {
         guard config.llmEnabled else { throw LLMError.missingConfig("llm disabled") }
-        guard !config.llmEndpoint.isEmpty else { throw LLMError.missingConfig("endpoint") }
-        guard !config.llmModel.isEmpty else { throw LLMError.missingConfig("model") }
+        guard !config.llmEndpointEffective.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
 
         let categories = config.enabledCategories.joined(separator: ", ")
 
@@ -110,8 +110,8 @@ final class LLMClient {
     }
 
     func generateExample(for word: String) async throws -> VocabExample {
-        guard !config.llmEndpoint.isEmpty else { throw LLMError.missingConfig("endpoint") }
-        guard !config.llmModel.isEmpty else { throw LLMError.missingConfig("model") }
+        guard !config.llmEndpointEffective.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
 
         let prompt = """
         给单词 \"\(word)\" 生成 1 个英文例句（尽量贴近计算机/学习/工作语境），并给出中文翻译。
@@ -137,8 +137,8 @@ final class LLMClient {
     }
 
     func translate(text: String, target: String) async throws -> String {
-        guard !config.llmEndpoint.isEmpty else { throw LLMError.missingConfig("endpoint") }
-        guard !config.llmModel.isEmpty else { throw LLMError.missingConfig("model") }
+        guard !config.llmEndpointEffective.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
 
         let to = target.lowercased() == "zh" ? "中文" : "英文"
         let prompt = """
@@ -200,20 +200,21 @@ final class LLMClient {
     }
 
     private func requestLLM(prompt: String, attempt: Int) async throws -> String {
-        let endpoint = config.llmEndpoint
+        let endpoint = config.llmEndpointEffective
         guard let url = URL(string: endpoint) else { throw LLMError.invalidURL(endpoint) }
 
         var request = URLRequest(url: url, timeoutInterval: 30)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        if !config.llmApiKey.isEmpty {
-            request.setValue("Bearer \(config.llmApiKey)", forHTTPHeaderField: "Authorization")
+        let apiKey = config.llmApiKeyEffective
+        if !apiKey.isEmpty {
+            request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         }
 
         let body: [String: Any]
         if url.path.contains("/chat/completions") {
             body = [
-                "model": config.llmModel,
+                "model": config.llmModelEffective,
                 "messages": [
                     ["role": "system", "content": "You are a helpful assistant. Output JSON only."],
                     ["role": "user", "content": prompt],
@@ -223,7 +224,7 @@ final class LLMClient {
             ]
         } else {
             body = [
-                "model": config.llmModel,
+                "model": config.llmModelEffective,
                 "prompt": prompt,
                 "temperature": 0.7,
                 "max_tokens": 300,

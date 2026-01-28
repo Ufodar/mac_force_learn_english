@@ -55,7 +55,7 @@ final class SettingsWindowController: NSWindowController {
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.maximumNumberOfLines = 2
 
-        endpointField.placeholderString = "LLM endpoint, e.g. http://127.0.0.1:1234/v1/chat/completions"
+        endpointField.placeholderString = "LLM base or endpoint, e.g. http://127.0.0.1:1234/v1  (or .../v1/chat/completions)"
         modelField.placeholderString = "model"
         apiKeyField.placeholderString = "apiKey (optional)"
         intervalField.placeholderString = "interval seconds (e.g. 1200)"
@@ -154,9 +154,9 @@ final class SettingsWindowController: NSWindowController {
         }
         quickTranslateTargetPopup.isEnabled = c.quickTranslateEnabled
 
-        endpointField.stringValue = c.llmEndpoint
-        modelField.stringValue = c.llmModel
-        apiKeyField.stringValue = c.llmApiKey
+        endpointField.stringValue = c.llmEndpoint.isEmpty ? c.llmEndpointEffective : c.llmEndpoint
+        modelField.stringValue = c.llmModel.isEmpty ? c.llmModelEffective : c.llmModel
+        apiKeyField.stringValue = c.llmApiKey.isEmpty ? c.llmApiKeyEffective : c.llmApiKey
 
         intervalField.stringValue = String(Int(c.intervalSeconds))
         displayField.stringValue = String(Int(c.displaySeconds))

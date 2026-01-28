@@ -17,14 +17,29 @@ final class AppConfig {
         set { defaults.set(newValue, forKey: "llm.endpoint") }
     }
 
+    var llmEndpointEffective: String {
+        let raw = !llmEndpoint.isEmpty ? llmEndpoint : (env("LLM_BASE_URL") ?? env("OPENAI_BASE_URL") ?? env("LLM_ENDPOINT") ?? "")
+        return Self.resolveLLMEndpoint(raw)
+    }
+
     var llmApiKey: String {
         get { defaults.string(forKey: "llm.apiKey") ?? "" }
         set { defaults.set(newValue, forKey: "llm.apiKey") }
     }
 
+    var llmApiKeyEffective: String {
+        if !llmApiKey.isEmpty { return llmApiKey }
+        return env("LLM_API_KEY") ?? env("OPENAI_API_KEY") ?? ""
+    }
+
     var llmModel: String {
         get { defaults.string(forKey: "llm.model") ?? "" }
         set { defaults.set(newValue, forKey: "llm.model") }
+    }
+
+    var llmModelEffective: String {
+        if !llmModel.isEmpty { return llmModel }
+        return env("LLM_MODEL") ?? ""
     }
 
     var intervalSeconds: TimeInterval {
@@ -91,5 +106,42 @@ final class AppConfig {
             return ["cs", "gaokao3500", "cet4", "cet6"]
         }
         set { defaults.set(newValue, forKey: "llm.categories") }
+    }
+
+    private func env(_ key: String) -> String? {
+        let v = ProcessInfo.processInfo.environment[key]
+        let t = (v ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
+    }
+
+    static func resolveLLMEndpoint(_ input: String) -> String {
+        var s = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        while s.hasSuffix("/") { s.removeLast() }
+        if s.isEmpty { return "" }
+
+        // Already a full endpoint
+        if s.contains("/chat/completions") || s.contains("/completions") {
+            return s
+        }
+
+        // Common: user provides base URL
+        // - http://host:port/v1
+        // - http://host:port
+        if s.hasSuffix("/v1") {
+            return s + "/chat/completions"
+        }
+
+        if let url = URL(string: s) {
+            let path = url.path
+            if path.isEmpty || path == "/" {
+                return s + "/v1/chat/completions"
+            }
+            if path == "/v1" {
+                return s + "/chat/completions"
+            }
+        }
+
+        // Fall back: keep as-is
+        return s
     }
 }
