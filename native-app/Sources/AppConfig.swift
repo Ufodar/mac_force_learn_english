@@ -56,6 +56,17 @@ final class AppConfig {
         set { defaults.set(newValue, forKey: "overlay.dnd") }
     }
 
+    var quickTranslateEnabled: Bool {
+        get { defaults.object(forKey: "quickTranslate.enabled") as? Bool ?? false }
+        set { defaults.set(newValue, forKey: "quickTranslate.enabled") }
+    }
+
+    /// "en" | "zh" | "auto"
+    var quickTranslateTarget: String {
+        get { defaults.string(forKey: "quickTranslate.target") ?? "en" }
+        set { defaults.set(newValue, forKey: "quickTranslate.target") }
+    }
+
     var wordWeight: Int {
         get {
             let v = defaults.integer(forKey: "mix.wordWeight")
@@ -82,4 +93,3 @@ final class AppConfig {
         set { defaults.set(newValue, forKey: "llm.categories") }
     }
 }
-

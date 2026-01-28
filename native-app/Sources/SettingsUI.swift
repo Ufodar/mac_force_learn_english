@@ -12,6 +12,8 @@ final class SettingsWindowController: NSWindowController {
 
     private let enableLLMButton = NSButton(checkboxWithTitle: "Enable LLM", target: nil, action: nil)
     private let dndButton = NSButton(checkboxWithTitle: "Do Not Disturb", target: nil, action: nil)
+    private let quickTranslateButton = NSButton(checkboxWithTitle: "Quick Translate", target: nil, action: nil)
+    private let quickTranslateTargetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
 
     private let catCS = NSButton(checkboxWithTitle: "cs", target: nil, action: nil)
     private let catGaokao = NSButton(checkboxWithTitle: "gaokao3500", target: nil, action: nil)
@@ -24,7 +26,7 @@ final class SettingsWindowController: NSWindowController {
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 520),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -88,6 +90,12 @@ final class SettingsWindowController: NSWindowController {
         enableLLMButton.action = #selector(onToggleLLM)
         dndButton.target = self
         dndButton.action = #selector(onToggleDND)
+        quickTranslateButton.target = self
+        quickTranslateButton.action = #selector(onToggleQuickTranslate)
+
+        quickTranslateTargetPopup.addItems(withTitles: ["English", "Chinese", "Auto"])
+        quickTranslateTargetPopup.target = self
+        quickTranslateTargetPopup.action = #selector(onQuickTranslateTargetChanged)
 
         [catCS, catGaokao, catCet4, catCet6].forEach { b in
             b.target = self
@@ -99,7 +107,7 @@ final class SettingsWindowController: NSWindowController {
         catsRow.alignment = .centerY
         catsRow.spacing = 14
 
-        let toggles = NSStackView(views: [enableLLMButton, dndButton])
+        let toggles = NSStackView(views: [enableLLMButton, dndButton, quickTranslateButton])
         toggles.orientation = .horizontal
         toggles.alignment = .centerY
         toggles.spacing = 14
@@ -116,6 +124,7 @@ final class SettingsWindowController: NSWindowController {
         form.addArrangedSubview(row("Interval Seconds", intervalField))
         form.addArrangedSubview(row("Display Seconds", displayField))
         form.addArrangedSubview(row("New Words Before Review", newBeforeReviewField))
+        form.addArrangedSubview(row("Quick Translate Target", quickTranslateTargetPopup))
         form.addArrangedSubview(NSTextField(labelWithString: "Categories"))
         form.addArrangedSubview(catsRow)
         form.addArrangedSubview(buttons)
@@ -133,6 +142,17 @@ final class SettingsWindowController: NSWindowController {
         let c = AppConfig.shared
         enableLLMButton.state = c.llmEnabled ? .on : .off
         dndButton.state = c.doNotDisturb ? .on : .off
+        quickTranslateButton.state = c.quickTranslateEnabled ? .on : .off
+
+        switch c.quickTranslateTarget.lowercased() {
+        case "zh":
+            quickTranslateTargetPopup.selectItem(at: 1)
+        case "auto":
+            quickTranslateTargetPopup.selectItem(at: 2)
+        default:
+            quickTranslateTargetPopup.selectItem(at: 0)
+        }
+        quickTranslateTargetPopup.isEnabled = c.quickTranslateEnabled
 
         endpointField.stringValue = c.llmEndpoint
         modelField.stringValue = c.llmModel
@@ -153,6 +173,7 @@ final class SettingsWindowController: NSWindowController {
         let c = AppConfig.shared
         c.llmEnabled = enableLLMButton.state == .on
         c.doNotDisturb = dndButton.state == .on
+        c.quickTranslateEnabled = quickTranslateButton.state == .on
         c.llmEndpoint = endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         c.llmModel = modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         c.llmApiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -161,6 +182,7 @@ final class SettingsWindowController: NSWindowController {
         if let v = Double(displayField.stringValue) { c.displaySeconds = max(2, v) }
         if let v = Int(newBeforeReviewField.stringValue) { c.newWordsBeforeReview = max(1, v) }
 
+        onQuickTranslateTargetChanged()
         onCategoryChanged()
         statusLabel.stringValue = "Saved."
         onConfigChanged?()
@@ -189,6 +211,24 @@ final class SettingsWindowController: NSWindowController {
         onConfigChanged?()
     }
 
+    @objc private func onToggleQuickTranslate() {
+        AppConfig.shared.quickTranslateEnabled = quickTranslateButton.state == .on
+        quickTranslateTargetPopup.isEnabled = quickTranslateButton.state == .on
+        onConfigChanged?()
+    }
+
+    @objc private func onQuickTranslateTargetChanged() {
+        switch quickTranslateTargetPopup.indexOfSelectedItem {
+        case 1:
+            AppConfig.shared.quickTranslateTarget = "zh"
+        case 2:
+            AppConfig.shared.quickTranslateTarget = "auto"
+        default:
+            AppConfig.shared.quickTranslateTarget = "en"
+        }
+        onConfigChanged?()
+    }
+
     @objc private func onCategoryChanged() {
         var cats: [String] = []
         if catCS.state == .on { cats.append("cs") }
@@ -199,4 +239,3 @@ final class SettingsWindowController: NSWindowController {
         onConfigChanged?()
     }
 }
-

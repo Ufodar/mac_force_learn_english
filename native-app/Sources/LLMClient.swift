@@ -67,7 +67,14 @@ final class LLMClient {
 
         let maxAttempts = 6
         for attempt in 1...maxAttempts {
-            let content = try await requestLLM(prompt: prompt, attempt: attempt)
+            let content: String
+            do {
+                content = try await requestLLM(prompt: prompt, attempt: attempt)
+            } catch {
+                if attempt == maxAttempts { throw error }
+                continue
+            }
+
             guard let payload = parsePayload(from: content) else {
                 if attempt == maxAttempts { throw LLMError.invalidResponse("cannot parse json") }
                 continue
@@ -114,13 +121,62 @@ final class LLMClient {
 
         let maxAttempts = 4
         for attempt in 1...maxAttempts {
-            let content = try await requestLLM(prompt: prompt, attempt: attempt)
+            let content: String
+            do {
+                content = try await requestLLM(prompt: prompt, attempt: attempt)
+            } catch {
+                if attempt == maxAttempts { throw error }
+                continue
+            }
             if let obj = try? decoder.decode([String: String].self, from: Data(content.utf8)),
                let en = obj["exampleEn"], !en.isEmpty {
                 return VocabExample(en: en, zh: obj["exampleZh"] ?? "", createdAt: Date())
             }
         }
         throw LLMError.invalidResponse("cannot parse example")
+    }
+
+    func translate(text: String, target: String) async throws -> String {
+        guard !config.llmEndpoint.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModel.isEmpty else { throw LLMError.missingConfig("model") }
+
+        let to = target.lowercased() == "zh" ? "中文" : "英文"
+        let prompt = """
+        请把下面的文本翻译成\(to)，输出必须是严格 JSON（不要 Markdown，不要额外文本）：
+        {"translation":"..."}
+
+        文本：
+        \(text)
+        """
+
+        let maxAttempts = 4
+        for attempt in 1...maxAttempts {
+            let content: String
+            do {
+                content = try await requestLLM(prompt: prompt, attempt: attempt)
+            } catch {
+                if attempt == maxAttempts { throw error }
+                continue
+            }
+
+            if let obj = try? decoder.decode([String: String].self, from: Data(content.utf8)),
+               let t = obj["translation"], !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return t.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            // 容错：尝试从文本中截取第一个 {...} JSON
+            let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let start = trimmed.firstIndex(of: "{"),
+               let end = trimmed.lastIndex(of: "}") {
+                let sub = String(trimmed[start...end])
+                if let obj = try? decoder.decode([String: String].self, from: Data(sub.utf8)),
+                   let t = obj["translation"], !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    return t.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+            }
+        }
+
+        throw LLMError.invalidResponse("cannot parse translation")
     }
 
     private func parsePayload(from content: String) -> GeneratedItemPayload? {

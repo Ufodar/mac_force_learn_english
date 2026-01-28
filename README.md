@@ -28,7 +28,8 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
 
 然后打开 App → `EN → Settings…` 配置 LLM。
 
-> 入口：`EN → Show Now / Review / Do Not Disturb / Settings… / Stats`
+> 入口：`EN → Show Now / Review / Do Not Disturb / Quick Translate / Settings… / Stats`  
+> Quick Translate（划词翻译）需要系统授权：**系统设置 → 隐私与安全性 → 辅助功能**（必要），部分机器可能还需要 **输入监控**。
 
 ---
 

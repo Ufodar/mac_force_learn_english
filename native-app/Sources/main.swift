@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let llm = LLMClient()
     private let overlay = OverlayController()
     private let settingsWC = SettingsWindowController()
+    private let quickTranslate = QuickTranslateController()
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
@@ -17,14 +18,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupOverlayCallbacks()
         settingsWC.onConfigChanged = { [weak self] in
             self?.overlay.refreshDND()
+            self?.quickTranslate.applyConfig()
             self?.restartTimer()
+            self?.refreshMenuChecks()
         }
 
         restartTimer()
+        quickTranslate.applyConfig()
 
         if config.llmEndpoint.isEmpty || config.llmModel.isEmpty {
             settingsWC.show()
         }
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        quickTranslate.stop()
     }
 
     private func setupMenuBar() {
@@ -36,6 +44,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Review", action: #selector(onReview), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Do Not Disturb", action: #selector(onToggleDND), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Quick Translate", action: #selector(onToggleQuickTranslate), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(onSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Stats", action: #selector(onStats), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -66,6 +75,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for item in menu.items {
             if item.title == "Do Not Disturb" {
                 item.state = config.doNotDisturb ? .on : .off
+            }
+            if item.title == "Quick Translate" {
+                item.state = config.quickTranslateEnabled ? .on : .off
             }
             if item.title == "Review" {
                 item.state = isReviewMode ? .on : .off
@@ -192,6 +204,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func onToggleDND() { toggleDND() }
+
+    @objc private func onToggleQuickTranslate() {
+        config.quickTranslateEnabled.toggle()
+        quickTranslate.applyConfig()
+        refreshMenuChecks()
+    }
 
     @objc private func onSettings() { settingsWC.show() }
 
