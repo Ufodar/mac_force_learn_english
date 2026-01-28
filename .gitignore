@@ -5,3 +5,6 @@
 *.tmp
 *.log
 
+# native-app build artifacts
+native-app/build/
+native-app/dist/

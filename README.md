@@ -1,3 +1,41 @@
+# MacForceLearnEnglish：强制背单词/句子（原生 App + Hammerspoon 备选）
+
+你现在有两条路：
+
+## A) ✅ 原生 macOS App（推荐，支持 DMG）
+
+不依赖 Hammerspoon，常驻菜单栏（`EN`），定时弹出置顶覆盖卡片；可接入 OpenAI-compatible LLM 现场生成（含音标与例句），支持复习/统计/勿扰/设置。
+
+### 构建 DMG（无需 Xcode）
+
+```bash
+git clone https://github.com/Ufodar/mac_force_learn_english.git
+cd mac_force_learn_english
+bash native-app/scripts/dist.sh
+```
+
+产物：
+- `native-app/dist/MacForceLearnEnglish.dmg`
+- `native-app/dist/MacForceLearnEnglish.app`
+
+### 安装（未签名/未公证）
+
+把 `MacForceLearnEnglish.app` 拖到 Applications 后，执行：
+
+```bash
+sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
+```
+
+然后打开 App → `EN → Settings…` 配置 LLM。
+
+> 入口：`EN → Show Now / Review / Do Not Disturb / Settings… / Stats`
+
+---
+
+## B) Hammerspoon 版本（旧方案）
+
+下面内容是 Hammerspoon 的脚本方案（如果你还想用它）。
+
 # Mac 单词/句子“定时置顶弹窗”最快实现（Hammerspoon）
 
 这套方案不需要写完整 App：用 Hammerspoon 常驻后台，每隔一段时间弹出一个覆盖屏幕的置顶卡片（可盖住全屏窗口），几秒后自动消失。
