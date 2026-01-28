@@ -57,10 +57,10 @@ final class LLMClient {
         let prompt: String
         if wantWord {
             prompt = """
-            你是一个英语学习内容生成器。请生成 1 个英文单词，偏向：计算机/高考3500/四级/六级，避免太生僻。
+            你是一个英语学习内容生成器。请生成 1 个英文单词，偏向：计算机/学习/考试词汇（初中/高中/四级/六级/考研/托福/SAT），避免太生僻。
             你必须避免重复（如果你看到一个候选词疑似重复，就换一个新词）。
             输出必须是严格 JSON（不要 Markdown，不要额外文本），格式如下：
-            {"type":"word","front":"WORD","phonetic":"/IPA/","back":"中文释义（简洁，1-2行）","category":"cs|gaokao3500|cet4|cet6","exampleEn":"英文例句（尽量计算机/学习场景）","exampleZh":"例句中文翻译"}
+            {"type":"word","front":"WORD","phonetic":"/IPA/","back":"中文释义（简洁，1-2行）","category":"junior|high|cet4|cet6|kaoyan|toefl|sat","exampleEn":"英文例句（尽量计算机/学习场景）","exampleZh":"例句中文翻译"}
             额外要求：
             - phonetic 必须是 IPA，形如 /.../
             - back 不要包含 IPA（IPA 放 phonetic）
@@ -70,7 +70,7 @@ final class LLMClient {
             prompt = """
             你是一个英语学习内容生成器。请生成 1 句英文短句（适合背诵，偏向计算机/学习/职场），并给出中文翻译。
             输出必须是严格 JSON（不要 Markdown，不要额外文本），格式如下：
-            {"type":"sentence","front":"ENGLISH","back":"中文翻译","category":"cs|gaokao3500|cet4|cet6"}
+            {"type":"sentence","front":"ENGLISH","back":"中文翻译","category":"junior|high|cet4|cet6|kaoyan|toefl|sat"}
             category 从 [\(categories)] 中选 1 个
             """
         }

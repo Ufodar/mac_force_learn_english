@@ -19,10 +19,21 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let quickTranslateTriggerPopup = NSPopUpButton(frame: .zero, pullsDown: false)
     private let quickTranslateTargetPopup = NSPopUpButton(frame: .zero, pullsDown: false)
 
-    private let catCS = NSButton(checkboxWithTitle: "cs", target: nil, action: nil)
-    private let catGaokao = NSButton(checkboxWithTitle: "gaokao3500", target: nil, action: nil)
-    private let catCet4 = NSButton(checkboxWithTitle: "cet4", target: nil, action: nil)
-    private let catCet6 = NSButton(checkboxWithTitle: "cet6", target: nil, action: nil)
+    private static let categoryOptions: [(id: String, title: String)] = [
+        ("junior", "初中"),
+        ("high", "高中"),
+        ("cet4", "四级 (CET-4)"),
+        ("cet6", "六级 (CET-6)"),
+        ("kaoyan", "考研"),
+        ("toefl", "托福 (TOEFL)"),
+        ("sat", "SAT"),
+    ]
+
+    private var categoryButtons: [String: NSButton] = [:]
+
+    private let offlineEnabledButton = NSButton(checkboxWithTitle: "Offline Vocabulary", target: nil, action: nil)
+    private let offlinePathField = NSTextField(string: "")
+    private let chooseOfflinePathButton = NSButton(title: "Choose…", target: nil, action: nil)
 
     private let statusLabel = NSTextField(labelWithString: "")
     private let diagnosticsLabel = NSTextField(wrappingLabelWithString: "")
@@ -67,7 +78,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
         diagnosticsLabel.textColor = .secondaryLabelColor
         diagnosticsLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
-        diagnosticsLabel.maximumNumberOfLines = 9
+        diagnosticsLabel.maximumNumberOfLines = 12
 
         endpointField.placeholderString = "LLM base or endpoint, e.g. http://127.0.0.1:1234/v1  (or .../v1/chat/completions)"
         modelField.placeholderString = "model"
@@ -75,6 +86,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         intervalField.placeholderString = "interval seconds (e.g. 1200)"
         displayField.placeholderString = "display seconds (e.g. 12)"
         newBeforeReviewField.placeholderString = "new words before review (e.g. 3)"
+        offlinePathField.placeholderString = "Path to english-vocabulary folder (optional)"
 
         let saveButton = NSButton(title: "Save", target: self, action: #selector(onSave))
         saveButton.bezelStyle = .rounded
@@ -136,15 +148,48 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         quickTranslateTargetPopup.target = self
         quickTranslateTargetPopup.action = #selector(onQuickTranslateTargetChanged)
 
-        [catCS, catGaokao, catCet4, catCet6].forEach { b in
-            b.target = self
-            b.action = #selector(onCategoryChanged)
+        for opt in Self.categoryOptions {
+            let b = NSButton(checkboxWithTitle: opt.title, target: self, action: #selector(onCategoryChanged))
+            categoryButtons[opt.id] = b
         }
 
-        let catsRow = NSStackView(views: [catCS, catGaokao, catCet4, catCet6])
-        catsRow.orientation = .horizontal
-        catsRow.alignment = .centerY
-        catsRow.spacing = 14
+        offlineEnabledButton.target = self
+        offlineEnabledButton.action = #selector(onToggleOffline)
+
+        chooseOfflinePathButton.bezelStyle = .rounded
+        chooseOfflinePathButton.target = self
+        chooseOfflinePathButton.action = #selector(onChooseOfflinePath)
+
+        let catsRow1 = NSStackView(views: [
+            categoryButtons["junior"]!,
+            categoryButtons["high"]!,
+            categoryButtons["cet4"]!,
+            categoryButtons["cet6"]!,
+        ])
+        catsRow1.orientation = .horizontal
+        catsRow1.alignment = .centerY
+        catsRow1.spacing = 14
+
+        let catsRow2 = NSStackView(views: [
+            categoryButtons["kaoyan"]!,
+            categoryButtons["toefl"]!,
+            categoryButtons["sat"]!,
+        ])
+        catsRow2.orientation = .horizontal
+        catsRow2.alignment = .centerY
+        catsRow2.spacing = 14
+
+        let catsGroup = NSStackView(views: [catsRow1, catsRow2])
+        catsGroup.orientation = .vertical
+        catsGroup.alignment = .leading
+        catsGroup.spacing = 8
+
+        offlinePathField.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        chooseOfflinePathButton.setContentHuggingPriority(.required, for: .horizontal)
+        let offlinePathRow = NSStackView(views: [offlinePathField, chooseOfflinePathButton])
+        offlinePathRow.orientation = .horizontal
+        offlinePathRow.alignment = .centerY
+        offlinePathRow.spacing = 10
 
         let toggles = NSStackView(views: [enableLLMButton, dndButton, quickTranslateButton, quickTranslateSaveButton])
         toggles.orientation = .horizontal
@@ -176,7 +221,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         form.addArrangedSubview(row("Quick Translate Trigger", quickTranslateTriggerPopup))
         form.addArrangedSubview(row("Quick Translate Target", quickTranslateTargetPopup))
         form.addArrangedSubview(NSTextField(labelWithString: "Categories"))
-        form.addArrangedSubview(catsRow)
+        form.addArrangedSubview(catsGroup)
+        form.addArrangedSubview(NSTextField(labelWithString: "Offline"))
+        form.addArrangedSubview(offlineEnabledButton)
+        form.addArrangedSubview(row("Vocab Path", offlinePathRow))
         form.addArrangedSubview(buttons)
         form.addArrangedSubview(statusLabel)
         let separator = NSBox()
@@ -232,10 +280,12 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         newBeforeReviewField.stringValue = String(c.newWordsBeforeReview)
 
         let enabled = Set(c.enabledCategories)
-        catCS.state = enabled.contains("cs") ? .on : .off
-        catGaokao.state = enabled.contains("gaokao3500") ? .on : .off
-        catCet4.state = enabled.contains("cet4") ? .on : .off
-        catCet6.state = enabled.contains("cet6") ? .on : .off
+        for (id, b) in categoryButtons {
+            b.state = enabled.contains(id) ? .on : .off
+        }
+
+        offlineEnabledButton.state = c.offlineEnabled ? .on : .off
+        offlinePathField.stringValue = c.offlineVocabPath.isEmpty ? c.offlineVocabPathEffective : c.offlineVocabPath
     }
 
     @objc private func onSave() {
@@ -247,6 +297,8 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         c.llmEndpoint = endpointField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         c.llmModel = modelField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         c.llmApiKey = apiKeyField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        c.offlineEnabled = offlineEnabledButton.state == .on
+        c.offlineVocabPath = offlinePathField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let v = Double(intervalField.stringValue) { c.intervalSeconds = max(5, v) }
         if let v = Double(displayField.stringValue) { c.displaySeconds = max(2, v) }
@@ -349,12 +401,38 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     @objc private func onCategoryChanged() {
         var cats: [String] = []
-        if catCS.state == .on { cats.append("cs") }
-        if catGaokao.state == .on { cats.append("gaokao3500") }
-        if catCet4.state == .on { cats.append("cet4") }
-        if catCet6.state == .on { cats.append("cet6") }
-        AppConfig.shared.enabledCategories = cats.isEmpty ? ["cs"] : cats
+        for opt in Self.categoryOptions {
+            if categoryButtons[opt.id]?.state == .on { cats.append(opt.id) }
+        }
+        let fallback = Self.categoryOptions.map(\.id)
+        AppConfig.shared.enabledCategories = cats.isEmpty ? fallback : cats
         onConfigChanged?()
+    }
+
+    @objc private func onToggleOffline() {
+        AppConfig.shared.offlineEnabled = offlineEnabledButton.state == .on
+        onConfigChanged?()
+    }
+
+    @objc private func onChooseOfflinePath() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "Choose your english-vocabulary folder"
+
+        if !AppConfig.shared.offlineVocabPathEffective.isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: AppConfig.shared.offlineVocabPathEffective, isDirectory: true)
+        }
+
+        panel.beginSheetModal(for: window!) { [weak self] res in
+            guard res == .OK, let url = panel.url else { return }
+            self?.offlinePathField.stringValue = url.path
+            AppConfig.shared.offlineVocabPath = url.path
+            self?.statusLabel.stringValue = "Offline vocab path set."
+            self?.onConfigChanged?()
+        }
     }
 
     func windowWillClose(_ notification: Notification) {
@@ -390,10 +468,17 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let copiesLine = copies.isEmpty ? "Copies found: ?" : "Copies found: \(copies.count)"
         let copiesDetails = copies.prefix(3).joined(separator: "\n")
 
+        let offlineEnabled = AppConfig.shared.offlineEnabled
+        let offlinePath = AppConfig.shared.offlineVocabPathEffective
+        let offlineExists = (!offlinePath.isEmpty && FileManager.default.fileExists(atPath: offlinePath))
+        let offlineLine = "Offline: \(offlineEnabled ? "ON" : "OFF")  Path: \(offlinePath.isEmpty ? "(empty)" : offlinePath)"
+
         diagnosticsLabel.stringValue = [
             "App: \(bundlePath)",
             "Bundle: \(bundleId) v\(version) (\(build))",
             "Accessibility: \(ax ? "OK" : "NO")    Input Monitoring: \(listen ? "OK" : "NO")",
+            offlineLine,
+            "Offline folder exists: \(offlineExists ? "YES" : "NO")",
             "Installed in /Applications: \(inApplications ? "YES" : "NO")",
             copiesLine,
             copiesDetails.isEmpty ? nil : "First copies:\n\(copiesDetails)",

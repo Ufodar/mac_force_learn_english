@@ -6,6 +6,7 @@
 
 - 定时弹出：覆盖所有窗口（含全屏）置顶显示
 - LLM 生成：单词（含 IPA 音标+释义+例句）/句子（含翻译），自动去重并保存
+- 离线词库：支持本地 `english-vocabulary` 目录（无需 LLM 也能刷单词/句子，按类别筛选）
 - 复习模式：手动刷旧词（不会自动消失）
 - 勿扰模式：暂停定时弹窗
 - 划词翻译：选中文本后按 `⌘⌥P` 弹出翻译气泡（单词带 IPA；支持 `More` 多释义；气泡不会自动消失，点击关闭；可在 Settings 切换为自动）
@@ -23,6 +24,8 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
 ```
 
 4) 打开 App → 菜单栏 `EN → Settings…` 配置 LLM（endpoint / model / apiKey）
+
+> 如果你有本地词库：把 `english-vocabulary` 放在常用路径（如 `~/Documents/english-vocabulary`），或在 Settings 里手动选择 `Vocab Path`。
 
 > 划词翻译需要系统授权：**系统设置 → 隐私与安全性 → 辅助功能** 勾选 `MacForceLearnEnglish`（必要），部分机器可能还需要 **输入监控**。
 
@@ -57,6 +60,7 @@ open native-app/dist/MacForceLearnEnglish.dmg
 - 入口：`native-app/`
 - 数据保存：`~/Library/Application Support/MacForceLearnEnglish/store.json`
 - LLM：支持 `/v1/chat/completions` 或 `/v1/completions`（按 endpoint path 自动判断）
+- 离线词库：指向 `english-vocabulary/json_original/json-sentence/`（在 Settings 配置/自动探测）
 
 ## 说明
 

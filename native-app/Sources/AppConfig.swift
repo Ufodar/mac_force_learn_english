@@ -114,9 +114,36 @@ final class AppConfig {
             if let arr = defaults.array(forKey: "llm.categories") as? [String], !arr.isEmpty {
                 return arr
             }
-            return ["cs", "gaokao3500", "cet4", "cet6"]
+            return ["junior", "high", "cet4", "cet6", "kaoyan", "toefl", "sat"]
         }
         set { defaults.set(newValue, forKey: "llm.categories") }
+    }
+
+    var offlineEnabled: Bool {
+        get { defaults.object(forKey: "offline.enabled") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "offline.enabled") }
+    }
+
+    /// Path to an `english-vocabulary` folder.
+    var offlineVocabPath: String {
+        get { defaults.string(forKey: "offline.vocabPath") ?? "" }
+        set { defaults.set(newValue, forKey: "offline.vocabPath") }
+    }
+
+    var offlineVocabPathEffective: String {
+        if !offlineVocabPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return offlineVocabPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        let candidates = [
+            home.appendingPathComponent("Documents/code/studyProject/english-vocabulary").path,
+            home.appendingPathComponent("Documents/english-vocabulary").path,
+            home.appendingPathComponent("english-vocabulary").path,
+        ]
+        for p in candidates where FileManager.default.fileExists(atPath: p) {
+            return p
+        }
+        return ""
     }
 
     private func env(_ key: String) -> String? {

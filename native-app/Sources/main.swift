@@ -6,10 +6,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let config = AppConfig.shared
     private let store = VocabStore()
     private let llm = LLMClient()
+    private let offline = OfflineVocabProvider()
     private let overlay = OverlayController()
     private let settingsWC = SettingsWindowController()
     private lazy var quickTranslate = QuickTranslateController(store: store, llm: llm)
     private lazy var wordbookWC = WordbookWindowController(store: store)
+    private let mainWC = MainWindowController()
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
@@ -20,11 +22,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMenuBar()
         setupOverlayCallbacks()
         warnIfNotInstalledInApplications()
+
+        mainWC.onShowNow = { [weak self] in
+            Task { await self?.showNext(mode: .manual) }
+        }
+        mainWC.onToggleDND = { [weak self] in
+            self?.toggleDND()
+        }
+        mainWC.onToggleReview = { [weak self] in
+            self?.onReview()
+        }
+        mainWC.onToggleQuickTranslate = { [weak self] in
+            self?.onToggleQuickTranslate()
+        }
+        mainWC.onOpenSettings = { [weak self] in
+            self?.settingsWC.show()
+        }
+        mainWC.onOpenWordbook = { [weak self] in
+            self?.wordbookWC.show()
+        }
+        mainWC.onOpenStats = { [weak self] in
+            self?.onStats()
+        }
+        mainWC.onOpenQuickTranslateStatus = { [weak self] in
+            self?.quickTranslate.debugShowStatus()
+        }
+        mainWC.isReviewModeProvider = { [weak self] in
+            self?.isReviewMode ?? false
+        }
+        mainWC.summaryProvider = { [weak self] in
+            guard let self else { return "" }
+            let offlinePath = self.config.offlineVocabPathEffective
+            let offlineOK = self.config.offlineEnabled && !offlinePath.isEmpty && FileManager.default.fileExists(atPath: offlinePath)
+            let llmOK = self.config.llmEnabled && !self.config.llmEndpointEffective.isEmpty && !self.config.llmModelEffective.isEmpty
+            let words = self.store.data.items.filter { $0.type == .word }.count
+            let sentences = self.store.data.items.filter { $0.type == .sentence }.count
+            return "Offline: \(offlineOK ? "READY" : "NO")   LLM: \(llmOK ? "READY" : "NO")\nWords: \(words)   Sentences: \(sentences)"
+        }
+
         settingsWC.onConfigChanged = { [weak self] in
             self?.overlay.refreshDND()
             self?.quickTranslate.applyConfig()
             self?.restartTimer()
             self?.refreshMenuChecks()
+            self?.mainWC.refresh()
         }
         settingsWC.onRequestQuickTranslateNow = { [weak self] in
             self?.quickTranslate.debugShowStatus()
@@ -36,13 +77,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         restartTimer()
         quickTranslate.applyConfig()
 
-        if store.data.items.isEmpty || config.llmEndpointEffective.isEmpty || config.llmModelEffective.isEmpty {
-            settingsWC.show()
+        // Only force-open Settings when there is no content source available yet.
+        if store.data.items.isEmpty {
+            let llmReady = !config.llmEndpointEffective.isEmpty && !config.llmModelEffective.isEmpty
+            let offlinePath = config.offlineVocabPathEffective
+            let offlineLikelyReady = config.offlineEnabled && !offlinePath.isEmpty && FileManager.default.fileExists(atPath: offlinePath)
+            if !llmReady && !offlineLikelyReady {
+                settingsWC.show()
+            }
         }
+
+        // Show a normal main window (not menu-only) for better usability.
+        mainWC.show()
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        settingsWC.show()
+        mainWC.show()
         return true
     }
 
@@ -146,6 +196,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 item.state = isReviewMode ? .on : .off
             }
         }
+        mainWC.refresh()
     }
 
     private func restartTimer() {
@@ -187,6 +238,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if mode == .auto, shouldReviewOldWordNow(), let old = store.pickOldWordForReview() {
             store.resetNewWordCounter()
             return (old, false)
+        }
+
+        if config.offlineEnabled {
+            if let item = await offline.pickItem(
+                enabledCategories: config.enabledCategories,
+                existingDedupeKeys: existingDedupeKeys(),
+                wordWeight: config.wordWeight,
+                sentenceWeight: config.sentenceWeight
+            ) {
+                _ = store.addItemIfNew(item)
+                return (item, item.type == .word)
+            }
         }
 
         let generated = try? await llm.generateItem(existingDedupeKeys: existingDedupeKeys())
