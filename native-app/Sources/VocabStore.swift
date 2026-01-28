@@ -63,6 +63,45 @@ final class VocabStore {
         return true
     }
 
+    func findItem(type: VocabItemType, front: String) -> VocabItem? {
+        let key = Self.dedupeKey(type: type, front: front)
+        return data.items.first { existing in
+            Self.dedupeKey(type: existing.type, front: existing.front) == key
+        }
+    }
+
+    @discardableResult
+    func upsertItem(type: VocabItemType, front: String, back: String, phonetic: String? = nil, category: String? = nil) -> VocabItem {
+        let key = Self.dedupeKey(type: type, front: front)
+        if let idx = data.items.firstIndex(where: { Self.dedupeKey(type: $0.type, front: $0.front) == key }) {
+            var item = data.items[idx]
+            item.back = back
+            if let p = phonetic, !p.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                item.phonetic = p
+            }
+            if item.category == nil { item.category = category }
+            data.items[idx] = item
+            save()
+            return item
+        }
+
+        let item = VocabItem(
+            id: UUID(),
+            type: type,
+            front: front,
+            back: back,
+            phonetic: phonetic,
+            category: category,
+            examples: [],
+            createdAt: Date(),
+            lastShownAt: nil,
+            timesShown: 0
+        )
+        data.items.append(item)
+        save()
+        return item
+    }
+
     func updateItem(_ updated: VocabItem) {
         if let idx = data.items.firstIndex(where: { $0.id == updated.id }) {
             data.items[idx] = updated
@@ -109,4 +148,3 @@ final class VocabStore {
         Self.dedupeKey(type: type, front: front)
     }
 }
-

@@ -34,7 +34,7 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
   - Show Now：立刻弹一次
   - Review：进入复习模式（不会自动消失）
   - Do Not Disturb：勿扰（定时弹窗暂停）
-  - Quick Translate：划词翻译（全局选中文本后弹出小气泡翻译）
+  - Quick Translate：划词翻译（默认：选中文本后按 `⌘⌥P` 翻译）
   - Settings：配置 LLM/间隔/时长/类别/复习插入规则
   - Stats：简单统计
 

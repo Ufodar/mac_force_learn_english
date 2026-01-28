@@ -8,7 +8,7 @@
 - LLM 生成：单词（含 IPA 音标+释义+例句）/句子（含翻译），自动去重并保存
 - 复习模式：手动刷旧词（不会自动消失）
 - 勿扰模式：暂停定时弹窗
-- 划词翻译：在任意应用里选中一段文本后自动弹出翻译气泡
+- 划词翻译：选中文本后按 `⌘⌥P` 弹出翻译气泡（可在 Settings 切换为自动）
 - 简约设置：在 App 内配置 LLM/间隔/类别等
 
 ## 安装（推荐 DMG）
@@ -32,6 +32,7 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
   - `Review`：进入复习模式（不会自动消失）
   - `Do Not Disturb`：勿扰（定时暂停）
   - `Quick Translate`：划词翻译开关
+  - `Quick Translate Status`：查看权限/安装路径/是否有重复拷贝
   - `Settings…`：配置 LLM/间隔/类别/复习插入规则
   - `Stats`：简单统计
 
@@ -58,4 +59,3 @@ open native-app/dist/MacForceLearnEnglish.dmg
 ## 旧方案
 
 - Hammerspoon 版本（可选）：`hammerspoon/README.md`
-

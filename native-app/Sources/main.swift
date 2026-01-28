@@ -8,7 +8,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let llm = LLMClient()
     private let overlay = OverlayController()
     private let settingsWC = SettingsWindowController()
-    private let quickTranslate = QuickTranslateController()
+    private lazy var quickTranslate = QuickTranslateController(store: store, llm: llm)
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
@@ -35,6 +35,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if store.data.items.isEmpty || config.llmEndpointEffective.isEmpty || config.llmModelEffective.isEmpty {
             settingsWC.show()
         }
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        settingsWC.show()
+        return true
     }
 
     func applicationWillTerminate(_ notification: Notification) {

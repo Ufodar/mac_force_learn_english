@@ -2,6 +2,32 @@ import ApplicationServices
 import Carbon.HIToolbox
 import Cocoa
 
+private let quickTranslateHotKeySignature: OSType = OSType(0x4D464C45) // "MFLE"
+private let quickTranslateHotKeyId: UInt32 = 1
+
+private let quickTranslateHotKeyHandler: EventHandlerUPP = { _, theEvent, userData in
+    guard let theEvent, let userData else { return noErr }
+
+    var hkID = EventHotKeyID()
+    let err = GetEventParameter(
+        theEvent,
+        EventParamName(kEventParamDirectObject),
+        EventParamType(typeEventHotKeyID),
+        nil,
+        MemoryLayout<EventHotKeyID>.size,
+        nil,
+        &hkID
+    )
+    if err != noErr { return noErr }
+    if hkID.signature != quickTranslateHotKeySignature || hkID.id != quickTranslateHotKeyId { return noErr }
+
+    let controller = Unmanaged<QuickTranslateController>.fromOpaque(userData).takeUnretainedValue()
+    Task { @MainActor in
+        controller.translateSelectionNow()
+    }
+    return noErr
+}
+
 @MainActor
 final class QuickTranslateController {
     private var mouseMonitor: Any?
@@ -13,18 +39,23 @@ final class QuickTranslateController {
     private var eventTapSource: CFRunLoopSource?
     private var lastEnsureAttemptAt: CFAbsoluteTime = 0
     private var didShowPermissionHint: Bool = false
+    private var hotKeyRef: EventHotKeyRef?
+    private var hotKeyHandlerRef: EventHandlerRef?
+    private var lastHotKeyAt: CFAbsoluteTime = 0
 
     private var lastText: String = ""
     private var pendingPollText: String = ""
 
+    private let store: VocabStore
     private let llm: LLMClient
     private let panel: NSPanel
     private let contentView: QuickTranslateView
 
-    init(llm: LLMClient = LLMClient()) {
+    init(store: VocabStore, llm: LLMClient = LLMClient()) {
+        self.store = store
         self.llm = llm
 
-        self.contentView = QuickTranslateView(frame: NSRect(x: 0, y: 0, width: 520, height: 180))
+        self.contentView = QuickTranslateView(frame: NSRect(x: 0, y: 0, width: 360, height: 120))
 
         let p = NSPanel(
             contentRect: contentView.frame,
@@ -51,11 +82,8 @@ final class QuickTranslateController {
     }
 
     func applyConfig() {
-        if AppConfig.shared.quickTranslateEnabled {
-            start()
-        } else {
-            stop()
-        }
+        stop()
+        if AppConfig.shared.quickTranslateEnabled { start() }
     }
 
     func start() {
@@ -65,18 +93,14 @@ final class QuickTranslateController {
         }
 
         requestAccessibilityPromptIfNeeded()
-        requestInputMonitoringPromptIfNeeded()
 
-        ensureMonitors(throttled: false)
-
-        // Polling helps apps that don't emit global mouse events without Input Monitoring,
-        // and also helps apps that expose selected text via Accessibility.
-        // It only uses Accessibility selection (no Cmd+C fallback) to avoid spamming copy.
-        pollTimer?.invalidate()
-        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
-            Task { @MainActor in
-                self?.pollSelectionTick()
-            }
+        if AppConfig.shared.quickTranslateTrigger.lowercased() == "auto" {
+            requestInputMonitoringPromptIfNeeded()
+            ensureMonitors(throttled: false)
+            startPolling()
+        } else {
+            setupHotKeyIfNeeded()
+            show(original: "Quick Translate", translated: "Select text then press ⌘⌥P")
         }
 
         showPermissionHintIfNeeded()
@@ -89,10 +113,28 @@ final class QuickTranslateController {
         debounceWorkItem = nil
         currentTask?.cancel()
         currentTask = nil
-        pollTimer?.invalidate()
-        pollTimer = nil
+        stopPolling()
         tearDownEventTap()
+        tearDownHotKey()
         hide()
+    }
+
+    func translateSelectionNow() {
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastHotKeyAt < 0.25 { return }
+        lastHotKeyAt = now
+
+        guard AppConfig.shared.quickTranslateEnabled else { return }
+        guard shouldHandleNow() else { return }
+
+        guard let text = fetchSelectedText().map(normalizeSelectionForLookup), isReasonable(text) else {
+            show(original: "No selection", translated: "Select a word/sentence first, then press ⌘⌥P")
+            return
+        }
+
+        Task { @MainActor in
+            await self.handleTrigger(text: text, allowDuplicate: true)
+        }
     }
 
     private func scheduleCheck() {
@@ -110,12 +152,13 @@ final class QuickTranslateController {
         guard AppConfig.shared.quickTranslateEnabled else { return }
 
         guard shouldHandleNow() else { return }
-        guard let text = fetchSelectedText(), isReasonable(text) else { return }
-        await handleTrigger(text: text)
+        guard let text = fetchSelectedText().map(normalizeSelectionForLookup), isReasonable(text) else { return }
+        await handleTrigger(text: text, allowDuplicate: false)
     }
 
     private func pollSelectionTick() {
         guard AppConfig.shared.quickTranslateEnabled else { return }
+        guard AppConfig.shared.quickTranslateTrigger.lowercased() == "auto" else { return }
         guard shouldHandleNow() else { return }
 
         ensureMonitors(throttled: true)
@@ -127,15 +170,15 @@ final class QuickTranslateController {
         // Wait for the selection to be stable for at least two ticks.
         if text == pendingPollText {
             Task { @MainActor in
-                await self.handleTrigger(text: text)
+                await self.handleTrigger(text: text, allowDuplicate: false)
             }
         } else {
             pendingPollText = text
         }
     }
 
-    private func handleTrigger(text: String) async {
-        if text == lastText { return }
+    private func handleTrigger(text: String, allowDuplicate: Bool) async {
+        if !allowDuplicate, text == lastText { return }
         lastText = text
 
         currentTask?.cancel()
@@ -143,11 +186,24 @@ final class QuickTranslateController {
             guard let self else { return }
             do {
                 let target = resolveTargetLanguage(for: text)
+                let kind = inferItemType(from: text)
+
+                if let cached = store.findItem(type: kind, front: text) {
+                    if Task.isCancelled { return }
+                    await MainActor.run {
+                        self.show(original: text, translated: cached.back)
+                    }
+                    self.recordQuickTranslateIfNeeded(itemType: kind, front: text, back: cached.back, phonetic: cached.phonetic)
+                    return
+                }
+
+                await MainActor.run { self.show(original: text, translated: "Translating…") }
                 let translated = try await llm.translate(text: text, target: target)
                 if Task.isCancelled { return }
                 await MainActor.run {
                     self.show(original: text, translated: translated)
                 }
+                self.recordQuickTranslateIfNeeded(itemType: kind, front: text, back: translated, phonetic: nil)
             } catch {
                 if Task.isCancelled { return }
                 await MainActor.run {
@@ -160,11 +216,13 @@ final class QuickTranslateController {
     private func show(original: String, translated: String) {
         contentView.render(original: original, translated: translated)
 
+        let size = contentView.preferredSize(maxWidth: 420)
+        panel.setContentSize(size)
+
         let mouse = NSEvent.mouseLocation
         let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main
         let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
 
-        let size = panel.frame.size
         var x = mouse.x + 14
         var y = mouse.y - size.height - 14
 
@@ -281,7 +339,6 @@ final class QuickTranslateController {
 
     private func fetchSelectedTextViaCopyPreservingClipboard() -> String? {
         guard AXIsProcessTrusted() else { return nil }
-        guard CGPreflightListenEventAccess() else { return nil }
 
         let pb = NSPasteboard.general
         let snapshot = PasteboardSnapshot.capture(from: pb)
@@ -325,10 +382,87 @@ final class QuickTranslateController {
         show(original: "Quick Translate Status", translated: permissionStatusString())
     }
 
+    private func setupHotKeyIfNeeded() {
+        guard hotKeyRef == nil else { return }
+
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let installStatus = InstallEventHandler(
+            GetApplicationEventTarget(),
+            quickTranslateHotKeyHandler,
+            1,
+            &eventType,
+            Unmanaged.passUnretained(self).toOpaque(),
+            &hotKeyHandlerRef
+        )
+        if installStatus != noErr {
+            NSLog("[quick_translate] InstallEventHandler failed: \(installStatus)")
+            hotKeyHandlerRef = nil
+            return
+        }
+
+        var hkID = EventHotKeyID(signature: quickTranslateHotKeySignature, id: quickTranslateHotKeyId)
+        let modifiers = UInt32(cmdKey | optionKey)
+        let keyCode = UInt32(kVK_ANSI_P)
+        let registerStatus = RegisterEventHotKey(keyCode, modifiers, hkID, GetApplicationEventTarget(), 0, &hotKeyRef)
+        if registerStatus != noErr {
+            NSLog("[quick_translate] RegisterEventHotKey failed: \(registerStatus)")
+            hotKeyRef = nil
+        }
+    }
+
+    private func tearDownHotKey() {
+        if let hk = hotKeyRef {
+            UnregisterEventHotKey(hk)
+        }
+        hotKeyRef = nil
+
+        if let h = hotKeyHandlerRef {
+            RemoveEventHandler(h)
+        }
+        hotKeyHandlerRef = nil
+    }
+
+    private func startPolling() {
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.pollSelectionTick()
+            }
+        }
+    }
+
+    private func stopPolling() {
+        pollTimer?.invalidate()
+        pollTimer = nil
+        pendingPollText = ""
+    }
+
     private func normalizeText(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "" }
         return trimmed.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+    }
+
+    private func normalizeSelectionForLookup(_ text: String) -> String {
+        let normalized = normalizeText(text)
+        var trimSet = CharacterSet.whitespacesAndNewlines
+        trimSet.formUnion(.punctuationCharacters)
+        trimSet.formUnion(.symbols)
+        return normalized.trimmingCharacters(in: trimSet)
+    }
+
+    private func inferItemType(from text: String) -> VocabItemType {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.range(of: "\\s", options: .regularExpression) != nil { return .sentence }
+        if t.range(of: "^[A-Za-z][A-Za-z\\-']*$", options: .regularExpression) != nil { return .word }
+        return .sentence
+    }
+
+    private func recordQuickTranslateIfNeeded(itemType: VocabItemType, front: String, back: String, phonetic: String?) {
+        guard AppConfig.shared.quickTranslateSaveToWordbook else { return }
+        let item = store.upsertItem(type: itemType, front: front, back: back, phonetic: phonetic)
+        let countedAsNewWord = (item.type == .word && item.timesShown == 0)
+        _ = store.recordShown(item, countedAsNewWord: countedAsNewWord)
     }
 
     private func setupEventTapIfPossible() {
@@ -410,12 +544,23 @@ final class QuickTranslateController {
         if didShowPermissionHint { return }
         let ax = AXIsProcessTrusted()
         let listen = CGPreflightListenEventAccess()
-        if ax && listen { return }
+        if needsInputMonitoring() {
+            if ax && listen { return }
+        } else {
+            if ax { return }
+        }
         didShowPermissionHint = true
-        show(
-            original: "Quick Translate needs permissions",
-            translated: "Accessibility: \(ax ? "OK" : "NO"), Input Monitoring: \(listen ? "OK" : "NO"). Enable them for this app in System Settings."
-        )
+        if needsInputMonitoring() {
+            show(
+                original: "Quick Translate needs permissions",
+                translated: "Accessibility: \(ax ? "OK" : "NO"), Input Monitoring: \(listen ? "OK" : "NO"). Enable them for this app in System Settings."
+            )
+        } else {
+            show(
+                original: "Quick Translate needs permission",
+                translated: "Accessibility: \(ax ? "OK" : "NO"). Enable it for this app in System Settings."
+            )
+        }
     }
 
     private func permissionStatusString() -> String {
@@ -428,6 +573,10 @@ final class QuickTranslateController {
 
     private func isInstalledInApplicationsFolder() -> Bool {
         Bundle.main.bundlePath.hasPrefix("/Applications/")
+    }
+
+    private func needsInputMonitoring() -> Bool {
+        AppConfig.shared.quickTranslateTrigger.lowercased() == "auto"
     }
 
     private func containsCJK(_ text: String) -> Bool {
@@ -445,7 +594,6 @@ final class QuickTranslateController {
 final class QuickTranslateView: NSView {
     private let card = NSView()
     private let originalLabel = NSTextField(labelWithString: "")
-    private let arrowLabel = NSTextField(labelWithString: "→")
     private let translatedLabel = NSTextField(labelWithString: "")
     private let hintLabel = NSTextField(labelWithString: "")
 
@@ -465,32 +613,24 @@ final class QuickTranslateView: NSView {
 
         originalLabel.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
         originalLabel.textColor = .labelColor
-        originalLabel.maximumNumberOfLines = 2
-        originalLabel.lineBreakMode = .byTruncatingTail
-
-        arrowLabel.font = NSFont.systemFont(ofSize: 14, weight: .regular)
-        arrowLabel.textColor = .tertiaryLabelColor
+        originalLabel.maximumNumberOfLines = 4
+        originalLabel.lineBreakMode = .byWordWrapping
 
         translatedLabel.font = NSFont.systemFont(ofSize: 14, weight: .regular)
         translatedLabel.textColor = .labelColor
-        translatedLabel.maximumNumberOfLines = 4
+        translatedLabel.maximumNumberOfLines = 8
+        translatedLabel.lineBreakMode = .byWordWrapping
 
         hintLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         hintLabel.textColor = .secondaryLabelColor
         hintLabel.maximumNumberOfLines = 1
         hintLabel.stringValue = "Click to dismiss"
 
-        let topRow = NSStackView(views: [originalLabel, arrowLabel, translatedLabel])
-        topRow.orientation = .horizontal
-        topRow.alignment = .centerY
-        topRow.distribution = .fill
-        topRow.spacing = 8
-
-        let stack = NSStackView(views: [topRow, hintLabel])
+        let stack = NSStackView(views: [originalLabel, translatedLabel, hintLabel])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.distribution = .fill
-        stack.spacing = 10
+        stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
 
         card.addSubview(stack)
@@ -515,6 +655,45 @@ final class QuickTranslateView: NSView {
     func render(original: String, translated: String) {
         originalLabel.stringValue = original
         translatedLabel.stringValue = translated
+    }
+
+    func preferredSize(maxWidth: CGFloat) -> NSSize {
+        let minWidth: CGFloat = 220
+        let paddingH: CGFloat = 14 * 2
+        let paddingV: CGFloat = 12 * 2
+        let interSpacing: CGFloat = 8
+
+        let original = originalLabel.stringValue
+        let translated = translatedLabel.stringValue
+        let hint = hintLabel.stringValue
+
+        let originalFont = originalLabel.font ?? NSFont.systemFont(ofSize: 14, weight: .semibold)
+        let translatedFont = translatedLabel.font ?? NSFont.systemFont(ofSize: 14, weight: .regular)
+        let hintFont = hintLabel.font ?? NSFont.systemFont(ofSize: 11, weight: .regular)
+
+        let originalSingle = (original as NSString).size(withAttributes: [.font: originalFont]).width
+        let translatedSingle = (translated as NSString).size(withAttributes: [.font: translatedFont]).width
+        let hintSingle = (hint as NSString).size(withAttributes: [.font: hintFont]).width
+
+        let targetWidth = min(maxWidth, max(minWidth, max(originalSingle, translatedSingle, hintSingle) + paddingH))
+        let contentWidth = max(80, targetWidth - paddingH)
+
+        func height(_ text: String, font: NSFont) -> CGFloat {
+            let rect = (text as NSString).boundingRect(
+                with: NSSize(width: contentWidth, height: .greatestFiniteMagnitude),
+                options: [.usesLineFragmentOrigin, .usesFontLeading],
+                attributes: [.font: font],
+                context: nil
+            )
+            return ceil(rect.height)
+        }
+
+        let h1 = height(original, font: originalFont)
+        let h2 = height(translated, font: translatedFont)
+        let h3 = height(hint, font: hintFont)
+        let totalH = paddingV + h1 + h2 + h3 + interSpacing * 2
+
+        return NSSize(width: ceil(targetWidth), height: min(280, max(88, totalH)))
     }
 
     override func mouseDown(with event: NSEvent) {

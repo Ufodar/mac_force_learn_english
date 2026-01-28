@@ -76,10 +76,21 @@ final class AppConfig {
         set { defaults.set(newValue, forKey: "quickTranslate.enabled") }
     }
 
+    /// "hotkey" | "auto"
+    var quickTranslateTrigger: String {
+        get { defaults.string(forKey: "quickTranslate.trigger") ?? "hotkey" }
+        set { defaults.set(newValue, forKey: "quickTranslate.trigger") }
+    }
+
     /// "en" | "zh" | "auto"
     var quickTranslateTarget: String {
         get { defaults.string(forKey: "quickTranslate.target") ?? "auto" }
         set { defaults.set(newValue, forKey: "quickTranslate.target") }
+    }
+
+    var quickTranslateSaveToWordbook: Bool {
+        get { defaults.object(forKey: "quickTranslate.saveToWordbook") as? Bool ?? true }
+        set { defaults.set(newValue, forKey: "quickTranslate.saveToWordbook") }
     }
 
     var wordWeight: Int {
