@@ -8,8 +8,10 @@ final class QuickTranslateController {
     private var debounceWorkItem: DispatchWorkItem?
     private var hideWorkItem: DispatchWorkItem?
     private var currentTask: Task<Void, Never>?
+    private var pollTimer: Timer?
 
     private var lastText: String = ""
+    private var pendingPollText: String = ""
 
     private let llm: LLMClient
     private let panel: NSPanel
@@ -61,6 +63,16 @@ final class QuickTranslateController {
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             self?.scheduleCheck()
         }
+
+        // Polling helps apps that don't emit global mouse events without Input Monitoring,
+        // and also helps apps that expose selected text via Accessibility.
+        // It only uses Accessibility selection (no Cmd+C fallback) to avoid spamming copy.
+        pollTimer?.invalidate()
+        pollTimer = Timer.scheduledTimer(withTimeInterval: 0.35, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.pollSelectionTick()
+            }
+        }
     }
 
     func stop() {
@@ -70,6 +82,8 @@ final class QuickTranslateController {
         debounceWorkItem = nil
         currentTask?.cancel()
         currentTask = nil
+        pollTimer?.invalidate()
+        pollTimer = nil
         hide()
     }
 
@@ -77,17 +91,40 @@ final class QuickTranslateController {
         debounceWorkItem?.cancel()
         let work = DispatchWorkItem { [weak self] in
             Task { @MainActor in
-                await self?.handleTrigger()
+                await self?.handleTriggerFromEvent()
             }
         }
         debounceWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.22, execute: work)
     }
 
-    private func handleTrigger() async {
+    private func handleTriggerFromEvent() async {
         guard AppConfig.shared.quickTranslateEnabled else { return }
 
+        guard shouldHandleNow() else { return }
         guard let text = fetchSelectedText(), isReasonable(text) else { return }
+        await handleTrigger(text: text)
+    }
+
+    private func pollSelectionTick() {
+        guard AppConfig.shared.quickTranslateEnabled else { return }
+        guard shouldHandleNow() else { return }
+
+        let text = fetchSelectedTextViaAccessibility().map(normalizeText) ?? ""
+        if text.isEmpty { pendingPollText = ""; return }
+        if !isReasonable(text) { pendingPollText = ""; return }
+
+        // Wait for the selection to be stable for at least two ticks.
+        if text == pendingPollText {
+            Task { @MainActor in
+                await self.handleTrigger(text: text)
+            }
+        } else {
+            pendingPollText = text
+        }
+    }
+
+    private func handleTrigger(text: String) async {
         if text == lastText { return }
         lastText = text
 
@@ -162,6 +199,12 @@ final class QuickTranslateController {
         }
         if target == "zh" { return "zh" }
         return "en"
+    }
+
+    private func shouldHandleNow() -> Bool {
+        let front = NSWorkspace.shared.frontmostApplication?.bundleIdentifier ?? ""
+        let mine = Bundle.main.bundleIdentifier ?? ""
+        return !mine.isEmpty && front != mine
     }
 
     private func isReasonable(_ text: String) -> Bool {
