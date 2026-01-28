@@ -1,4 +1,5 @@
 import Cocoa
+import CoreServices
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -17,11 +18,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         setupMenuBar()
         setupOverlayCallbacks()
+        warnIfNotInstalledInApplications()
         settingsWC.onConfigChanged = { [weak self] in
             self?.overlay.refreshDND()
             self?.quickTranslate.applyConfig()
             self?.restartTimer()
             self?.refreshMenuChecks()
+        }
+        settingsWC.onRequestQuickTranslateNow = { [weak self] in
+            self?.quickTranslate.debugShowStatus()
         }
 
         restartTimer()
@@ -92,6 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Do Not Disturb", action: #selector(onToggleDND), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quick Translate", action: #selector(onToggleQuickTranslate), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Quick Translate Status", action: #selector(onQuickTranslateStatus), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(onSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Stats", action: #selector(onStats), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -258,6 +264,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshMenuChecks()
     }
 
+    @objc private func onQuickTranslateStatus() {
+        quickTranslate.debugShowStatus()
+    }
+
     @objc private func onSettings() { settingsWC.show() }
 
     @objc private func onStats() {
@@ -271,6 +281,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func onQuit() {
         NSApp.terminate(nil)
+    }
+
+    private func warnIfNotInstalledInApplications() {
+        let path = Bundle.main.bundlePath
+        let bundleId = Bundle.main.bundleIdentifier ?? ""
+
+        var copies: [String] = []
+        if !bundleId.isEmpty {
+            var error: Unmanaged<CFError>?
+            if let urls = LSCopyApplicationURLsForBundleIdentifier(bundleId as CFString, &error)?.takeRetainedValue() as? [URL] {
+                copies = urls.map { $0.path }.sorted()
+            }
+        }
+
+        let multipleCopies = copies.count > 1
+        let notInApplications = !path.hasPrefix("/Applications/")
+        if !notInApplications, !multipleCopies { return }
+
+        let alert = NSAlert()
+        alert.messageText = notInApplications
+            ? "Move MacForceLearnEnglish.app to /Applications"
+            : "Multiple copies of this app found"
+
+        var info = ""
+        if notInApplications {
+            info += "You are running from:\n\(path)\n\n"
+            info += "macOS permissions (Accessibility / Input Monitoring) may keep prompting or not work if you run from a DMG/Downloads/build folder.\n\n"
+        }
+        if multipleCopies {
+            info += "Copies detected (\(copies.count)):\n"
+            info += copies.prefix(6).joined(separator: "\n")
+            if copies.count > 6 { info += "\n…" }
+            info += "\n\nTip: keep only one copy in /Applications and open it from Finder (not Spotlight) to avoid permission mismatch."
+        }
+
+        alert.informativeText = info.trimmingCharacters(in: .whitespacesAndNewlines)
+        alert.addButton(withTitle: "Open /Applications")
+        alert.addButton(withTitle: "Continue")
+
+        let res = alert.runModal()
+        if res == .alertFirstButtonReturn {
+            NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications", isDirectory: true))
+        }
     }
 }
 

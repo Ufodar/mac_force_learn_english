@@ -11,6 +11,8 @@ final class QuickTranslateController {
     private var pollTimer: Timer?
     private var eventTap: CFMachPort?
     private var eventTapSource: CFRunLoopSource?
+    private var lastEnsureAttemptAt: CFAbsoluteTime = 0
+    private var didShowPermissionHint: Bool = false
 
     private var lastText: String = ""
     private var pendingPollText: String = ""
@@ -57,16 +59,15 @@ final class QuickTranslateController {
     }
 
     func start() {
-        guard mouseMonitor == nil else { return }
+        guard isInstalledInApplicationsFolder() else {
+            show(original: "Quick Translate disabled", translated: "Move the app to /Applications to make macOS permissions stick.")
+            return
+        }
 
         requestAccessibilityPromptIfNeeded()
         requestInputMonitoringPromptIfNeeded()
 
-        setupEventTapIfPossible()
-
-        mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
-            self?.scheduleCheck()
-        }
+        ensureMonitors(throttled: false)
 
         // Polling helps apps that don't emit global mouse events without Input Monitoring,
         // and also helps apps that expose selected text via Accessibility.
@@ -77,6 +78,8 @@ final class QuickTranslateController {
                 self?.pollSelectionTick()
             }
         }
+
+        showPermissionHintIfNeeded()
     }
 
     func stop() {
@@ -114,6 +117,8 @@ final class QuickTranslateController {
     private func pollSelectionTick() {
         guard AppConfig.shared.quickTranslateEnabled else { return }
         guard shouldHandleNow() else { return }
+
+        ensureMonitors(throttled: true)
 
         let text = fetchSelectedTextViaAccessibility().map(normalizeText) ?? ""
         if text.isEmpty { pendingPollText = ""; return }
@@ -316,6 +321,10 @@ final class QuickTranslateController {
         _ = CGRequestListenEventAccess()
     }
 
+    func debugShowStatus() {
+        show(original: "Quick Translate Status", translated: permissionStatusString())
+    }
+
     private func normalizeText(_ text: String) -> String {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty { return "" }
@@ -373,6 +382,52 @@ final class QuickTranslateController {
             CFMachPortInvalidate(tap)
         }
         eventTap = nil
+    }
+
+    private func ensureMonitors(throttled: Bool) {
+        let now = CFAbsoluteTimeGetCurrent()
+        if throttled, now - lastEnsureAttemptAt < 3 { return }
+        lastEnsureAttemptAt = now
+
+        if eventTap == nil {
+            setupEventTapIfPossible()
+            if eventTap == nil {
+                NSLog("[quick_translate] event tap unavailable (check Input Monitoring permission)")
+            }
+        }
+
+        if mouseMonitor == nil {
+            mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
+                self?.scheduleCheck()
+            }
+            if mouseMonitor == nil {
+                NSLog("[quick_translate] global monitor unavailable (check Input Monitoring permission)")
+            }
+        }
+    }
+
+    private func showPermissionHintIfNeeded() {
+        if didShowPermissionHint { return }
+        let ax = AXIsProcessTrusted()
+        let listen = CGPreflightListenEventAccess()
+        if ax && listen { return }
+        didShowPermissionHint = true
+        show(
+            original: "Quick Translate needs permissions",
+            translated: "Accessibility: \(ax ? "OK" : "NO"), Input Monitoring: \(listen ? "OK" : "NO"). Enable them for this app in System Settings."
+        )
+    }
+
+    private func permissionStatusString() -> String {
+        let ax = AXIsProcessTrusted()
+        let listen = CGPreflightListenEventAccess()
+        let inApps = isInstalledInApplicationsFolder()
+        let path = Bundle.main.bundlePath
+        return "Accessibility: \(ax ? "OK" : "NO")\nInput Monitoring: \(listen ? "OK" : "NO")\nInstalled in /Applications: \(inApps ? "YES" : "NO")\nApp: \(path)"
+    }
+
+    private func isInstalledInApplicationsFolder() -> Bool {
+        Bundle.main.bundlePath.hasPrefix("/Applications/")
     }
 
     private func containsCJK(_ text: String) -> Bool {

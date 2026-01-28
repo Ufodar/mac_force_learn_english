@@ -1,7 +1,9 @@
+import ApplicationServices
 import Cocoa
+import CoreServices
 
 @MainActor
-final class SettingsWindowController: NSWindowController {
+final class SettingsWindowController: NSWindowController, NSWindowDelegate {
     private let endpointField = NSTextField(string: "")
     private let modelField = NSTextField(string: "")
     private let apiKeyField = NSSecureTextField(string: "")
@@ -21,12 +23,15 @@ final class SettingsWindowController: NSWindowController {
     private let catCet6 = NSButton(checkboxWithTitle: "cet6", target: nil, action: nil)
 
     private let statusLabel = NSTextField(labelWithString: "")
+    private let diagnosticsLabel = NSTextField(wrappingLabelWithString: "")
+    private var diagnosticsTimer: Timer?
 
     var onConfigChanged: (() -> Void)?
+    var onRequestQuickTranslateNow: (() -> Void)?
 
     init() {
         let window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 560, height: 620),
+            contentRect: NSRect(x: 0, y: 0, width: 560, height: 700),
             styleMask: [.titled, .closable],
             backing: .buffered,
             defer: false
@@ -34,6 +39,7 @@ final class SettingsWindowController: NSWindowController {
         window.title = "Settings"
         window.isReleasedWhenClosed = false
         super.init(window: window)
+        window.delegate = self
         buildUI()
         loadFromConfig()
     }
@@ -46,6 +52,7 @@ final class SettingsWindowController: NSWindowController {
             w.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
         }
+        startDiagnosticsTimer()
     }
 
     private func buildUI() {
@@ -54,6 +61,10 @@ final class SettingsWindowController: NSWindowController {
 
         statusLabel.textColor = .secondaryLabelColor
         statusLabel.maximumNumberOfLines = 2
+
+        diagnosticsLabel.textColor = .secondaryLabelColor
+        diagnosticsLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        diagnosticsLabel.maximumNumberOfLines = 9
 
         endpointField.placeholderString = "LLM base or endpoint, e.g. http://127.0.0.1:1234/v1  (or .../v1/chat/completions)"
         modelField.placeholderString = "model"
@@ -67,6 +78,21 @@ final class SettingsWindowController: NSWindowController {
 
         let testButton = NSButton(title: "Test LLM", target: self, action: #selector(onTest))
         testButton.bezelStyle = .rounded
+
+        let requestPermButton = NSButton(title: "Request Permissions", target: self, action: #selector(onRequestPermissions))
+        requestPermButton.bezelStyle = .rounded
+
+        let openAXButton = NSButton(title: "Open Accessibility", target: self, action: #selector(onOpenAccessibility))
+        openAXButton.bezelStyle = .rounded
+
+        let openIMButton = NSButton(title: "Open Input Monitoring", target: self, action: #selector(onOpenInputMonitoring))
+        openIMButton.bezelStyle = .rounded
+
+        let tryQuickTranslateButton = NSButton(title: "Quick Translate Status", target: self, action: #selector(onTryQuickTranslateNow))
+        tryQuickTranslateButton.bezelStyle = .rounded
+
+        let copyDiagnosticsButton = NSButton(title: "Copy Diagnostics", target: self, action: #selector(onCopyDiagnostics))
+        copyDiagnosticsButton.bezelStyle = .rounded
 
         let form = NSStackView()
         form.orientation = .vertical
@@ -117,6 +143,16 @@ final class SettingsWindowController: NSWindowController {
         buttons.alignment = .centerY
         buttons.spacing = 12
 
+        let diagButtonsRow1 = NSStackView(views: [requestPermButton, openAXButton, openIMButton])
+        diagButtonsRow1.orientation = .horizontal
+        diagButtonsRow1.alignment = .centerY
+        diagButtonsRow1.spacing = 12
+
+        let diagButtonsRow2 = NSStackView(views: [tryQuickTranslateButton, copyDiagnosticsButton])
+        diagButtonsRow2.orientation = .horizontal
+        diagButtonsRow2.alignment = .centerY
+        diagButtonsRow2.spacing = 12
+
         form.addArrangedSubview(toggles)
         form.addArrangedSubview(row("Endpoint", endpointField))
         form.addArrangedSubview(row("Model", modelField))
@@ -129,6 +165,15 @@ final class SettingsWindowController: NSWindowController {
         form.addArrangedSubview(catsRow)
         form.addArrangedSubview(buttons)
         form.addArrangedSubview(statusLabel)
+        let separator = NSBox()
+        separator.boxType = .separator
+        separator.translatesAutoresizingMaskIntoConstraints = false
+        separator.widthAnchor.constraint(equalToConstant: 520).isActive = true
+        form.addArrangedSubview(separator)
+        form.addArrangedSubview(NSTextField(labelWithString: "Diagnostics"))
+        form.addArrangedSubview(diagnosticsLabel)
+        form.addArrangedSubview(diagButtonsRow1)
+        form.addArrangedSubview(diagButtonsRow2)
 
         content.addSubview(form)
         NSLayoutConstraint.activate([
@@ -201,6 +246,31 @@ final class SettingsWindowController: NSWindowController {
         }
     }
 
+    @objc private func onRequestPermissions() {
+        requestAccessibilityPromptIfNeeded()
+        requestInputMonitoringPromptIfNeeded()
+        updateDiagnostics()
+    }
+
+    @objc private func onOpenAccessibility() {
+        openPrivacyPane(anchor: "Privacy_Accessibility")
+    }
+
+    @objc private func onOpenInputMonitoring() {
+        openPrivacyPane(anchor: "Privacy_ListenEvent")
+    }
+
+    @objc private func onTryQuickTranslateNow() {
+        onRequestQuickTranslateNow?()
+    }
+
+    @objc private func onCopyDiagnostics() {
+        let pb = NSPasteboard.general
+        pb.clearContents()
+        pb.setString(diagnosticsLabel.stringValue, forType: .string)
+        statusLabel.stringValue = "Diagnostics copied."
+    }
+
     @objc private func onToggleLLM() {
         AppConfig.shared.llmEnabled = enableLLMButton.state == .on
         onConfigChanged?()
@@ -237,5 +307,77 @@ final class SettingsWindowController: NSWindowController {
         if catCet6.state == .on { cats.append("cet6") }
         AppConfig.shared.enabledCategories = cats.isEmpty ? ["cs"] : cats
         onConfigChanged?()
+    }
+
+    func windowWillClose(_ notification: Notification) {
+        stopDiagnosticsTimer()
+    }
+
+    private func startDiagnosticsTimer() {
+        stopDiagnosticsTimer()
+        updateDiagnostics()
+        diagnosticsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.updateDiagnostics()
+            }
+        }
+    }
+
+    private func stopDiagnosticsTimer() {
+        diagnosticsTimer?.invalidate()
+        diagnosticsTimer = nil
+    }
+
+    private func updateDiagnostics() {
+        let bundlePath = Bundle.main.bundlePath
+        let bundleId = Bundle.main.bundleIdentifier ?? "(unknown bundle id)"
+        let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "?"
+
+        let ax = AXIsProcessTrusted()
+        let listen = CGPreflightListenEventAccess()
+        let inApplications = bundlePath.hasPrefix("/Applications/")
+
+        let copies = appCopies(bundleId: bundleId)
+        let copiesLine = copies.isEmpty ? "Copies found: ?" : "Copies found: \(copies.count)"
+        let copiesDetails = copies.prefix(3).joined(separator: "\n")
+
+        diagnosticsLabel.stringValue = [
+            "App: \(bundlePath)",
+            "Bundle: \(bundleId) v\(version) (\(build))",
+            "Accessibility: \(ax ? "OK" : "NO")    Input Monitoring: \(listen ? "OK" : "NO")",
+            "Installed in /Applications: \(inApplications ? "YES" : "NO")",
+            copiesLine,
+            copiesDetails.isEmpty ? nil : "First copies:\n\(copiesDetails)",
+            "Tip: if prompts repeat, delete other copies and open /Applications/MacForceLearnEnglish.app.",
+        ]
+        .compactMap { $0 }
+        .joined(separator: "\n")
+    }
+
+    private func appCopies(bundleId: String) -> [String] {
+        var error: Unmanaged<CFError>?
+        guard let urls = LSCopyApplicationURLsForBundleIdentifier(bundleId as CFString, &error)?.takeRetainedValue() as? [URL] else {
+            return []
+        }
+        return urls.map { $0.path }.sorted()
+    }
+
+    private func requestAccessibilityPromptIfNeeded() {
+        if AXIsProcessTrusted() { return }
+        let key = kAXTrustedCheckOptionPrompt.takeRetainedValue() as String
+        let options = [key: true] as CFDictionary
+        _ = AXIsProcessTrustedWithOptions(options)
+    }
+
+    private func requestInputMonitoringPromptIfNeeded() {
+        if CGPreflightListenEventAccess() { return }
+        _ = CGRequestListenEventAccess()
+    }
+
+    private func openPrivacyPane(anchor: String) {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(anchor)") {
+            NSWorkspace.shared.open(url)
+        }
     }
 }
