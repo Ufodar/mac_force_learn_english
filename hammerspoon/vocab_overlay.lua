@@ -66,6 +66,9 @@ local config = {
     apiKey = "", -- optional (sent as `Authorization: Bearer ...`)
     apiKeyEnv = "OPENAI_API_KEY",
     timeoutSeconds = 8,
+    retryBaseSeconds = 0.35,
+    retryFactor = 1.6,
+    retryMaxSeconds = 2.0,
     temperature = 0.2,
     maxTokens = 280,
     generate = {
@@ -1546,6 +1549,47 @@ local function buildSimplePayload(baseItem, opts)
   return payload
 end
 
+local function openAiRequestMode()
+  local endpoint = (type(config.llm.endpoint) == "string") and config.llm.endpoint or ""
+  local ep = endpoint:lower()
+  if ep:find("/chat/completions", 1, true) then
+    return "chat"
+  end
+  if ep:find("/completions", 1, true) then
+    return "completions"
+  end
+  return "chat"
+end
+
+local function openAiPromptFromMessages(messages)
+  if type(messages) ~= "table" then
+    return ""
+  end
+  local sys = type(messages[1]) == "table" and messages[1].content or ""
+  local user = type(messages[2]) == "table" and messages[2].content or ""
+  sys = type(sys) == "string" and sys or ""
+  user = type(user) == "string" and user or ""
+  if sys ~= "" and user ~= "" then
+    return sys .. "\n\n" .. user
+  end
+  return sys .. user
+end
+
+local function retryDelaySeconds(attemptN)
+  local base = tonumber(config.llm.retryBaseSeconds) or 0.35
+  local factor = tonumber(config.llm.retryFactor) or 1.6
+  local maxDelay = tonumber(config.llm.retryMaxSeconds) or 2.0
+  local n = math.max(1, tonumber(attemptN) or 1)
+  local delay = base * (factor ^ math.max(0, n - 1))
+  if delay > maxDelay then
+    delay = maxDelay
+  end
+  if delay < 0 then
+    delay = 0
+  end
+  return delay
+end
+
 local function buildOpenAiMessages(baseItem, opts)
   local prefs = config.llm.preferences or {}
   local language = (type(prefs.language) == "string" and prefs.language ~= "") and prefs.language or "zh"
@@ -1657,11 +1701,13 @@ local function buildOpenAiMessages(baseItem, opts)
 end
 
 local function buildOpenAiRequest(baseItem, opts)
-  local req = {
-    model = config.llm.model,
-    messages = buildOpenAiMessages(baseItem, opts),
-    temperature = tonumber(config.llm.temperature) or 0.2,
-  }
+  local mode = openAiRequestMode()
+  local req = { model = config.llm.model, temperature = tonumber(config.llm.temperature) or 0.2 }
+  if mode == "completions" then
+    req.prompt = openAiPromptFromMessages(buildOpenAiMessages(baseItem, opts))
+  else
+    req.messages = buildOpenAiMessages(baseItem, opts)
+  end
   local maxTokens = tonumber(config.llm.maxTokens)
   if maxTokens and maxTokens > 0 then
     req.max_tokens = math.floor(maxTokens)
@@ -1842,9 +1888,16 @@ local function requestGenerate(requestId, desiredType, desiredCategory, attempt,
     end
 
     if type(code) ~= "number" or code < 200 or code >= 300 then
-      log(("llm generate failed (attempt %d/%d): %s"):format(attemptN, maxRetries, tostring(code)))
+      local snippet = ""
+      if type(body) == "string" and body ~= "" then
+        snippet = " " .. trim(body):gsub("%s+", " "):sub(1, 180)
+      end
+      log(("llm generate failed (attempt %d/%d): %s%s"):format(attemptN, maxRetries, tostring(code), snippet))
       if attemptN < maxRetries then
-        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+        local delay = retryDelaySeconds(attemptN)
+        hs.timer.doAfter(delay, function()
+          requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+        end)
       else
         state.pending = nil
         if not showFallback() then
@@ -1858,7 +1911,10 @@ local function requestGenerate(requestId, desiredType, desiredCategory, attempt,
     if not isValidGeneratedItem(item, desiredType) then
       log(("llm generate invalid item (attempt %d/%d)"):format(attemptN, maxRetries))
       if attemptN < maxRetries then
-        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+        local delay = retryDelaySeconds(attemptN)
+        hs.timer.doAfter(delay, function()
+          requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+        end)
       else
         state.pending = nil
         if not showFallback() then
@@ -1873,7 +1929,10 @@ local function requestGenerate(requestId, desiredType, desiredCategory, attempt,
 
     if desiredType == "word" and not item.front:match("[%a]") then
       if attemptN < maxRetries then
-        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+        local delay = retryDelaySeconds(attemptN)
+        hs.timer.doAfter(delay, function()
+          requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, extraAvoid)
+        end)
       else
         state.pending = nil
         showFallback()
@@ -1886,7 +1945,10 @@ local function requestGenerate(requestId, desiredType, desiredCategory, attempt,
       local nextAvoid = extraAvoid or {}
       table.insert(nextAvoid, item.front)
       if attemptN < maxRetries then
-        requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, nextAvoid)
+        local delay = retryDelaySeconds(attemptN)
+        hs.timer.doAfter(delay, function()
+          requestGenerate(requestId, desiredType, desiredCategory, attemptN + 1, nextAvoid)
+        end)
       else
         state.pending = nil
         showFallback()
@@ -1938,9 +2000,16 @@ local function requestExample(requestId, item, attempt, extraAvoidExamples, opts
     end
 
     if type(code) ~= "number" or code < 200 or code >= 300 then
-      log(("llm example failed (attempt %d/%d): %s"):format(attemptN, maxRetries, tostring(code)))
+      local snippet = ""
+      if type(body) == "string" and body ~= "" then
+        snippet = " " .. trim(body):gsub("%s+", " "):sub(1, 180)
+      end
+      log(("llm example failed (attempt %d/%d): %s%s"):format(attemptN, maxRetries, tostring(code), snippet))
       if attemptN < maxRetries then
-        requestExample(requestId, item, attemptN + 1, extraAvoidExamples, opts)
+        local delay = retryDelaySeconds(attemptN)
+        hs.timer.doAfter(delay, function()
+          requestExample(requestId, item, attemptN + 1, extraAvoidExamples, opts)
+        end)
       else
         local silent = type(opts) == "table" and opts.silent
         state.pending = nil
@@ -1966,7 +2035,10 @@ local function requestExample(requestId, item, attempt, extraAvoidExamples, opts
         table.insert(nextAvoid, ex.en)
       end
       if attemptN < maxRetries then
-        requestExample(requestId, item, attemptN + 1, nextAvoid, opts)
+        local delay = retryDelaySeconds(attemptN)
+        hs.timer.doAfter(delay, function()
+          requestExample(requestId, item, attemptN + 1, nextAvoid, opts)
+        end)
       else
         local silent = type(opts) == "table" and opts.silent
         state.pending = nil
@@ -1988,7 +2060,10 @@ local function requestExample(requestId, item, attempt, extraAvoidExamples, opts
       local nextAvoid = extraAvoidExamples or {}
       table.insert(nextAvoid, ex.en)
       if attemptN < maxRetries then
-        requestExample(requestId, item, attemptN + 1, nextAvoid, opts)
+        local delay = retryDelaySeconds(attemptN)
+        hs.timer.doAfter(delay, function()
+          requestExample(requestId, item, attemptN + 1, nextAvoid, opts)
+        end)
       else
         local silent = type(opts) == "table" and opts.silent
         state.pending = nil
