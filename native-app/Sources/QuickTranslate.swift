@@ -1,11 +1,9 @@
 import ApplicationServices
-import Carbon.HIToolbox
 import Cocoa
 
 @MainActor
 final class QuickTranslateController {
     private var mouseMonitor: Any?
-    private var keyMonitor: Any?
     private var debounceWorkItem: DispatchWorkItem?
     private var hideWorkItem: DispatchWorkItem?
     private var currentTask: Task<Void, Never>?
@@ -54,27 +52,18 @@ final class QuickTranslateController {
     }
 
     func start() {
-        guard mouseMonitor == nil, keyMonitor == nil else { return }
+        guard mouseMonitor == nil else { return }
 
         requestAccessibilityPromptIfNeeded()
 
         mouseMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] _ in
             self?.scheduleCheck()
         }
-
-        keyMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
-            guard let self else { return }
-            guard event.modifierFlags.contains(.command) else { return }
-            guard event.charactersIgnoringModifiers?.lowercased() == "c" else { return }
-            self.scheduleCheck()
-        }
     }
 
     func stop() {
         if let m = mouseMonitor { NSEvent.removeMonitor(m) }
-        if let m = keyMonitor { NSEvent.removeMonitor(m) }
         mouseMonitor = nil
-        keyMonitor = nil
         debounceWorkItem?.cancel()
         debounceWorkItem = nil
         currentTask?.cancel()
@@ -186,10 +175,6 @@ final class QuickTranslateController {
             let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
             return t.isEmpty ? nil : t
         }
-        if let s = fetchSelectedTextViaCopyPreservingClipboard() {
-            let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
-            return t.isEmpty ? nil : t
-        }
         return nil
     }
 
@@ -205,62 +190,6 @@ final class QuickTranslateController {
 
         if let s = selected as? String, !s.isEmpty { return s }
         return nil
-    }
-
-    private struct PasteboardSnapshot {
-        var items: [[String: Data]]
-
-        static func capture(from pb: NSPasteboard) -> PasteboardSnapshot {
-            let items: [[String: Data]] = pb.pasteboardItems?.map { item in
-                var dict: [String: Data] = [:]
-                for t in item.types {
-                    if let data = item.data(forType: t) {
-                        dict[t.rawValue] = data
-                    }
-                }
-                return dict
-            } ?? []
-            return PasteboardSnapshot(items: items)
-        }
-
-        func restore(to pb: NSPasteboard) {
-            pb.clearContents()
-            let pbItems: [NSPasteboardItem] = items.map { dict in
-                let it = NSPasteboardItem()
-                for (type, data) in dict {
-                    it.setData(data, forType: NSPasteboard.PasteboardType(type))
-                }
-                return it
-            }
-            _ = pb.writeObjects(pbItems)
-        }
-    }
-
-    private func fetchSelectedTextViaCopyPreservingClipboard() -> String? {
-        let pb = NSPasteboard.general
-        let snapshot = PasteboardSnapshot.capture(from: pb)
-        let before = pb.changeCount
-
-        sendCopyShortcut()
-
-        for _ in 0..<12 {
-            if pb.changeCount != before { break }
-            usleep(25_000)
-        }
-
-        let text = pb.string(forType: .string)
-        snapshot.restore(to: pb)
-        return text
-    }
-
-    private func sendCopyShortcut() {
-        let src = CGEventSource(stateID: .combinedSessionState)
-        let keyDown = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_ANSI_C), keyDown: true)
-        keyDown?.flags = .maskCommand
-        let keyUp = CGEvent(keyboardEventSource: src, virtualKey: CGKeyCode(kVK_ANSI_C), keyDown: false)
-        keyUp?.flags = .maskCommand
-        keyDown?.post(tap: .cghidEventTap)
-        keyUp?.post(tap: .cghidEventTap)
     }
 
     private func requestAccessibilityPromptIfNeeded() {
