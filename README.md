@@ -8,7 +8,7 @@
 - LLM 生成：单词（含 IPA 音标+释义+例句）/句子（含翻译），自动去重并保存
 - 复习模式：手动刷旧词（不会自动消失）
 - 勿扰模式：暂停定时弹窗
-- 划词翻译：选中文本后按 `⌘⌥P` 弹出翻译气泡（单词会带 IPA；可在 Settings 切换为自动）
+- 划词翻译：选中文本后按 `⌘⌥P` 弹出翻译气泡（单词带 IPA；支持 `More` 多释义；气泡不会自动消失，点击关闭；可在 Settings 切换为自动）
 - 单词本：查看你查过的单词（Wordbook）
 - 简约设置：在 App 内配置 LLM/间隔/类别等
 
@@ -58,6 +58,6 @@ open native-app/dist/MacForceLearnEnglish.dmg
 - 数据保存：`~/Library/Application Support/MacForceLearnEnglish/store.json`
 - LLM：支持 `/v1/chat/completions` 或 `/v1/completions`（按 endpoint path 自动判断）
 
-## 旧方案
+## 说明
 
-- Hammerspoon 版本（可选）：`hammerspoon/README.md`
+本仓库以 `native-app/` 的原生 macOS App 为准。

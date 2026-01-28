@@ -32,6 +32,11 @@ final class LLMClient {
         var meaning: String
     }
 
+    struct WordLookupDetailsPayload: Codable {
+        var phonetic: String?
+        var senses: [WordSense]
+    }
+
     private let config: AppConfig
     private let decoder = JSONDecoder()
 
@@ -218,6 +223,52 @@ final class LLMClient {
         }
 
         throw LLMError.invalidResponse("cannot parse word lookup")
+    }
+
+    func lookupWordDetails(_ word: String, target: String) async throws -> WordLookupDetailsPayload {
+        guard !config.llmEndpointEffective.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
+
+        let to = target.lowercased() == "zh" ? "中文" : "英文"
+        let prompt = """
+        你是英语词典。请给单词 \"\(word)\" 提供：
+        1) IPA 音标
+        2) 多种释义（最多 6 个），每条包含词性 pos、释义 meaning、常用频率 freq。
+
+        输出必须是严格 JSON（不要 Markdown，不要额外文本），格式如下：
+        {"phonetic":"/IPA/","senses":[{"pos":"n.","meaning":"...","freq":5}]}
+
+        规则：
+        - phonetic 必须是 IPA，形如 /.../
+        - meaning 用 \(to)，不要包含 IPA
+        - freq 取 1-5 的整数，5 最常用
+        - senses 按 freq 从高到低排序（像有道词典那样先给最常用释义）
+        """
+
+        let maxAttempts = 4
+        for attempt in 1...maxAttempts {
+            let content: String
+            do {
+                content = try await requestLLM(prompt: prompt, attempt: attempt)
+            } catch {
+                if attempt == maxAttempts { throw error }
+                continue
+            }
+
+            if var payload: WordLookupDetailsPayload = parseJSON(content, as: WordLookupDetailsPayload.self) {
+                payload.phonetic = payload.phonetic?.trimmingCharacters(in: .whitespacesAndNewlines)
+                payload.senses = payload.senses
+                    .map { WordSense(pos: $0.pos.trimmingCharacters(in: .whitespacesAndNewlines), meaning: $0.meaning.trimmingCharacters(in: .whitespacesAndNewlines), freq: $0.freq) }
+                    .filter { !$0.pos.isEmpty && !$0.meaning.isEmpty }
+                    .sorted { a, b in
+                        if a.freq != b.freq { return a.freq > b.freq }
+                        return a.meaning.count < b.meaning.count
+                    }
+                if !payload.senses.isEmpty { return payload }
+            }
+        }
+
+        throw LLMError.invalidResponse("cannot parse word details")
     }
 
     private func parsePayload(from content: String) -> GeneratedItemPayload? {

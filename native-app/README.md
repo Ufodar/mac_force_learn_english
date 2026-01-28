@@ -1,6 +1,6 @@
 # MacForceLearnEnglish（原生 macOS App）
 
-目标：不用 Hammerspoon，直接运行一个常驻菜单栏的原生 App，定时弹出置顶覆盖卡片（单词/句子），并可接入 OpenAI-compatible LLM 现场生成（含音标与例句），支持复习/统计/勿扰。
+目标：常驻菜单栏的原生 macOS App，定时弹出置顶覆盖卡片（单词/句子），并可接入 OpenAI-compatible LLM 现场生成（含音标与例句），支持复习/统计/勿扰。
 
 ## 快速构建（无需 Xcode）
 
@@ -34,7 +34,7 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
   - Show Now：立刻弹一次
   - Review：进入复习模式（不会自动消失）
   - Do Not Disturb：勿扰（定时弹窗暂停）
-  - Quick Translate：划词翻译（默认：选中文本后按 `⌘⌥P` 翻译；单词会带 IPA）
+  - Quick Translate：划词翻译（默认：选中文本后按 `⌘⌥P` 翻译；单词会带 IPA；支持 `More` 多释义；气泡点击关闭，不会自动消失）
   - Wordbook：单词本（你查过的单词）
   - Settings：配置 LLM/间隔/时长/类别/复习插入规则
   - Stats：简单统计

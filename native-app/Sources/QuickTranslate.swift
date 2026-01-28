@@ -32,7 +32,6 @@ private let quickTranslateHotKeyHandler: EventHandlerUPP = { _, theEvent, userDa
 final class QuickTranslateController {
     private var mouseMonitor: Any?
     private var debounceWorkItem: DispatchWorkItem?
-    private var hideWorkItem: DispatchWorkItem?
     private var currentTask: Task<Void, Never>?
     private var pollTimer: Timer?
     private var eventTap: CFMachPort?
@@ -42,9 +41,12 @@ final class QuickTranslateController {
     private var hotKeyRef: EventHotKeyRef?
     private var hotKeyHandlerRef: EventHandlerRef?
     private var lastHotKeyAt: CFAbsoluteTime = 0
+    private var isFetchingDetails: Bool = false
 
     private var lastText: String = ""
     private var pendingPollText: String = ""
+    private var lastAnchorPoint: NSPoint = .zero
+    private var currentLookupWord: String?
 
     private let store: VocabStore
     private let llm: LLMClient
@@ -79,6 +81,14 @@ final class QuickTranslateController {
         contentView.onDismiss = { [weak self] in
             self?.hide()
         }
+        contentView.onDetailsToggled = { [weak self] in
+            self?.resizeAndReposition()
+        }
+        contentView.onRequestMoreMeanings = { [weak self] in
+            Task { @MainActor in
+                await self?.fetchMoreMeaningsIfNeeded()
+            }
+        }
     }
 
     func applyConfig() {
@@ -88,7 +98,7 @@ final class QuickTranslateController {
 
     func start() {
         guard isInstalledInApplicationsFolder() else {
-            show(original: "Quick Translate disabled", phonetic: nil, translated: "Move the app to /Applications to make macOS permissions stick.")
+            show(original: "Quick Translate disabled", phonetic: nil, translated: "Move the app to /Applications to make macOS permissions stick.", isWord: false, senses: nil)
             return
         }
 
@@ -100,7 +110,7 @@ final class QuickTranslateController {
             startPolling()
         } else {
             setupHotKeyIfNeeded()
-            show(original: "Quick Translate", phonetic: nil, translated: "Select text then press ⌘⌥P")
+            show(original: "Quick Translate", phonetic: nil, translated: "Select text then press ⌘⌥P", isWord: false, senses: nil)
         }
 
         showPermissionHintIfNeeded()
@@ -113,6 +123,8 @@ final class QuickTranslateController {
         debounceWorkItem = nil
         currentTask?.cancel()
         currentTask = nil
+        isFetchingDetails = false
+        currentLookupWord = nil
         stopPolling()
         tearDownEventTap()
         tearDownHotKey()
@@ -128,7 +140,7 @@ final class QuickTranslateController {
         guard shouldHandleNow() else { return }
 
         guard let text = fetchSelectedText().map(normalizeSelectionForLookup), isReasonable(text) else {
-            show(original: "No selection", phonetic: nil, translated: "Select a word/sentence first, then press ⌘⌥P")
+            show(original: "No selection", phonetic: nil, translated: "Select a word/sentence first, then press ⌘⌥P", isWord: false, senses: nil)
             return
         }
 
@@ -195,7 +207,7 @@ final class QuickTranslateController {
                     if let cached {
                         if Task.isCancelled { return }
                         await MainActor.run {
-                            self.show(original: text, phonetic: cached.phonetic, translated: cached.back)
+                            self.show(original: text, phonetic: cached.phonetic, translated: cached.back, isWord: true, senses: cached.senses)
                         }
                         _ = saveLookupIfEnabled(itemType: .word, front: text, back: cached.back, phonetic: cached.phonetic, countAsShown: true)
 
@@ -203,13 +215,13 @@ final class QuickTranslateController {
                             return
                         }
                     } else {
-                        await MainActor.run { self.show(original: text, phonetic: nil, translated: "Looking up…") }
+                        await MainActor.run { self.show(original: text, phonetic: nil, translated: "Looking up…", isWord: true, senses: nil) }
                     }
 
                     let payload = try await llm.lookupWord(text, target: target)
                     if Task.isCancelled { return }
                     await MainActor.run {
-                        self.show(original: text, phonetic: payload.phonetic, translated: payload.meaning)
+                        self.show(original: text, phonetic: payload.phonetic, translated: payload.meaning, isWord: true, senses: cached?.senses)
                     }
                     _ = saveLookupIfEnabled(
                         itemType: .word,
@@ -224,40 +236,47 @@ final class QuickTranslateController {
                 if let cached = store.findItem(type: kind, front: text) {
                     if Task.isCancelled { return }
                     await MainActor.run {
-                        self.show(original: text, phonetic: nil, translated: cached.back)
+                        self.show(original: text, phonetic: nil, translated: cached.back, isWord: false, senses: nil)
                     }
                     _ = saveLookupIfEnabled(itemType: kind, front: text, back: cached.back, phonetic: nil, countAsShown: true)
                     return
                 }
 
-                await MainActor.run { self.show(original: text, phonetic: nil, translated: "Translating…") }
+                await MainActor.run { self.show(original: text, phonetic: nil, translated: "Translating…", isWord: false, senses: nil) }
                 let translated = try await llm.translate(text: text, target: target)
                 if Task.isCancelled { return }
                 await MainActor.run {
-                    self.show(original: text, phonetic: nil, translated: translated)
+                    self.show(original: text, phonetic: nil, translated: translated, isWord: false, senses: nil)
                 }
                 _ = saveLookupIfEnabled(itemType: kind, front: text, back: translated, phonetic: nil, countAsShown: true)
             } catch {
                 if Task.isCancelled { return }
                 await MainActor.run {
-                    self.show(original: text, phonetic: nil, translated: "Failed: \(error)")
+                    self.show(original: text, phonetic: nil, translated: "Failed: \(error)", isWord: false, senses: nil)
                 }
             }
         }
     }
 
-    private func show(original: String, phonetic: String?, translated: String) {
-        contentView.render(original: original, phonetic: phonetic, translated: translated)
+    private func show(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?) {
+        currentLookupWord = (isWord && isEnglishWord(original)) ? original : nil
+        contentView.render(original: original, phonetic: phonetic, translated: translated, isWord: isWord, senses: senses)
 
-        let size = contentView.preferredSize(maxWidth: 420)
+        lastAnchorPoint = NSEvent.mouseLocation
+        resizeAndReposition()
+        panel.orderFrontRegardless()
+    }
+
+    private func resizeAndReposition() {
+        let size = contentView.preferredSize(maxWidth: 520)
         panel.setContentSize(size)
 
-        let mouse = NSEvent.mouseLocation
-        let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main
+        let anchor = lastAnchorPoint
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(anchor) }) ?? NSScreen.main
         let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
 
-        var x = mouse.x + 14
-        var y = mouse.y - size.height - 14
+        var x = anchor.x + 14
+        var y = anchor.y - size.height - 14
 
         if x + size.width > screenFrame.maxX - 10 {
             x = screenFrame.maxX - size.width - 10
@@ -266,30 +285,16 @@ final class QuickTranslateController {
             x = screenFrame.minX + 10
         }
         if y < screenFrame.minY + 10 {
-            y = mouse.y + 14
+            y = anchor.y + 14
         }
         if y + size.height > screenFrame.maxY - 10 {
             y = screenFrame.maxY - size.height - 10
         }
 
         panel.setFrameOrigin(NSPoint(x: x, y: y))
-        panel.orderFrontRegardless()
-
-        scheduleAutoHide()
-    }
-
-    private func scheduleAutoHide() {
-        hideWorkItem?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            Task { @MainActor in self?.hide() }
-        }
-        hideWorkItem = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: work)
     }
 
     private func hide() {
-        hideWorkItem?.cancel()
-        hideWorkItem = nil
         panel.orderOut(nil)
     }
 
@@ -412,7 +417,53 @@ final class QuickTranslateController {
     }
 
     func debugShowStatus() {
-        show(original: "Quick Translate Status", phonetic: nil, translated: permissionStatusString())
+        show(original: "Quick Translate Status", phonetic: nil, translated: permissionStatusString(), isWord: false, senses: nil)
+    }
+
+    private func fetchMoreMeaningsIfNeeded() async {
+        guard let word = currentLookupWord else { return }
+        if isFetchingDetails { return }
+        isFetchingDetails = true
+        defer { isFetchingDetails = false }
+
+        if let cached = store.findItem(type: .word, front: word), let senses = cached.senses, !senses.isEmpty {
+            contentView.setSenses(senses)
+            if let p = cached.phonetic { contentView.setPhonetic(p) }
+            resizeAndReposition()
+            return
+        }
+
+        contentView.setDetailsText("Loading…")
+        resizeAndReposition()
+
+        do {
+            let target = resolveTargetLanguage(for: word)
+            let payload = try await llm.lookupWordDetails(word, target: target)
+            if Task.isCancelled { return }
+
+            let existing = store.findItem(type: .word, front: word)
+            let bestBack = existing?.back.isEmpty == false ? existing?.back : payload.senses.first?.meaning
+            let bestPhonetic = (payload.phonetic?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+                ? existing?.phonetic
+                : payload.phonetic
+
+            _ = store.upsertItem(
+                type: .word,
+                front: word,
+                back: bestBack ?? "",
+                phonetic: bestPhonetic,
+                category: existing?.category ?? "lookup",
+                source: existing?.source ?? "lookup",
+                senses: payload.senses
+            )
+
+            contentView.setSenses(payload.senses)
+            if let p = bestPhonetic { contentView.setPhonetic(p) }
+            resizeAndReposition()
+        } catch {
+            contentView.setDetailsText("Failed to load meanings: \(error)")
+            resizeAndReposition()
+        }
     }
 
     private func setupHotKeyIfNeeded() {
@@ -498,7 +549,7 @@ final class QuickTranslateController {
     @discardableResult
     private func saveLookupIfEnabled(itemType: VocabItemType, front: String, back: String, phonetic: String?, countAsShown: Bool) -> VocabItem? {
         guard AppConfig.shared.quickTranslateSaveToWordbook else { return nil }
-        let item = store.upsertItem(type: itemType, front: front, back: back, phonetic: phonetic, category: "lookup", source: "lookup")
+        let item = store.upsertItem(type: itemType, front: front, back: back, phonetic: phonetic, category: "lookup", source: "lookup", senses: nil)
         guard countAsShown else { return item }
         let countedAsNewWord = (item.type == .word && item.timesShown == 0)
         return store.recordShown(item, countedAsNewWord: countedAsNewWord)
@@ -593,13 +644,17 @@ final class QuickTranslateController {
             show(
                 original: "Quick Translate needs permissions",
                 phonetic: nil,
-                translated: "Accessibility: \(ax ? "OK" : "NO"), Input Monitoring: \(listen ? "OK" : "NO"). Enable them for this app in System Settings."
+                translated: "Accessibility: \(ax ? "OK" : "NO"), Input Monitoring: \(listen ? "OK" : "NO"). Enable them for this app in System Settings.",
+                isWord: false,
+                senses: nil
             )
         } else {
             show(
                 original: "Quick Translate needs permission",
                 phonetic: nil,
-                translated: "Accessibility: \(ax ? "OK" : "NO"). Enable it for this app in System Settings."
+                translated: "Accessibility: \(ax ? "OK" : "NO"). Enable it for this app in System Settings.",
+                isWord: false,
+                senses: nil
             )
         }
     }
@@ -637,9 +692,18 @@ final class QuickTranslateView: NSView {
     private let originalLabel = NSTextField(labelWithString: "")
     private let phoneticLabel = NSTextField(labelWithString: "")
     private let translatedLabel = NSTextField(labelWithString: "")
+    private let detailsLabel = NSTextField(wrappingLabelWithString: "")
     private let hintLabel = NSTextField(labelWithString: "")
+    private let moreButton = NSButton(title: "More", target: nil, action: nil)
 
     var onDismiss: (() -> Void)?
+    var onDetailsToggled: (() -> Void)?
+    var onRequestMoreMeanings: (() -> Void)?
+
+    private var isWord: Bool = false
+    private var senses: [WordSense] = []
+    private var detailsVisible: Bool = false
+    private var lastKey: String = ""
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -661,18 +725,37 @@ final class QuickTranslateView: NSView {
         phoneticLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         phoneticLabel.textColor = .secondaryLabelColor
         phoneticLabel.maximumNumberOfLines = 1
+        phoneticLabel.isHidden = true
 
         translatedLabel.font = NSFont.systemFont(ofSize: 14, weight: .regular)
         translatedLabel.textColor = .labelColor
         translatedLabel.maximumNumberOfLines = 8
         translatedLabel.lineBreakMode = .byWordWrapping
 
+        detailsLabel.font = NSFont.systemFont(ofSize: 13, weight: .regular)
+        detailsLabel.textColor = .labelColor
+        detailsLabel.maximumNumberOfLines = 12
+        detailsLabel.lineBreakMode = .byWordWrapping
+        detailsLabel.isHidden = true
+
         hintLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         hintLabel.textColor = .secondaryLabelColor
         hintLabel.maximumNumberOfLines = 1
         hintLabel.stringValue = "Click to dismiss"
 
-        let stack = NSStackView(views: [originalLabel, phoneticLabel, translatedLabel, hintLabel])
+        moreButton.bezelStyle = .inline
+        moreButton.controlSize = .small
+        moreButton.target = self
+        moreButton.action = #selector(onMoreClicked)
+        moreButton.isHidden = true
+
+        let bottomRow = NSStackView(views: [hintLabel, moreButton])
+        bottomRow.orientation = .horizontal
+        bottomRow.alignment = .centerY
+        bottomRow.distribution = .fill
+        bottomRow.spacing = 10
+
+        let stack = NSStackView(views: [originalLabel, phoneticLabel, translatedLabel, detailsLabel, bottomRow])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.distribution = .fill
@@ -698,8 +781,27 @@ final class QuickTranslateView: NSView {
 
     required init?(coder: NSCoder) { nil }
 
-    func render(original: String, phonetic: String?, translated: String) {
+    func render(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?) {
         originalLabel.stringValue = original
+        setPhonetic(phonetic)
+        translatedLabel.stringValue = translated
+        self.isWord = isWord
+        self.senses = senses ?? []
+
+        let key = original
+        if key != lastKey {
+            detailsVisible = false
+            detailsLabel.isHidden = true
+        }
+        lastKey = key
+
+        updateMoreButtonVisibility()
+        if detailsVisible {
+            updateDetailsText()
+        }
+    }
+
+    func setPhonetic(_ phonetic: String?) {
         let p = (phonetic ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
         if p.isEmpty {
             phoneticLabel.stringValue = ""
@@ -708,7 +810,50 @@ final class QuickTranslateView: NSView {
             phoneticLabel.stringValue = p
             phoneticLabel.isHidden = false
         }
-        translatedLabel.stringValue = translated
+    }
+
+    func setSenses(_ senses: [WordSense]) {
+        self.senses = senses
+        updateMoreButtonVisibility()
+        if detailsVisible {
+            updateDetailsText()
+        }
+    }
+
+    func setDetailsText(_ text: String) {
+        detailsLabel.stringValue = text
+    }
+
+    private func updateMoreButtonVisibility() {
+        moreButton.isHidden = !isWord
+        moreButton.title = detailsVisible ? "Less" : "More"
+    }
+
+    private func updateDetailsText() {
+        if senses.isEmpty {
+            detailsLabel.stringValue = "Loading…"
+            return
+        }
+        var lines: [String] = []
+        for (idx, s) in senses.enumerated() {
+            let rank = max(1, min(5, s.freq))
+            lines.append("\(idx + 1). \(s.pos) (\(rank)) \(s.meaning)")
+        }
+        detailsLabel.stringValue = lines.joined(separator: "\n")
+    }
+
+    @objc private func onMoreClicked() {
+        guard isWord else { return }
+        detailsVisible.toggle()
+        detailsLabel.isHidden = !detailsVisible
+        updateMoreButtonVisibility()
+        if detailsVisible {
+            updateDetailsText()
+            if senses.isEmpty {
+                onRequestMoreMeanings?()
+            }
+        }
+        onDetailsToggled?()
     }
 
     func preferredSize(maxWidth: CGFloat) -> NSSize {
@@ -720,22 +865,35 @@ final class QuickTranslateView: NSView {
         let original = originalLabel.stringValue
         let phonetic = phoneticLabel.isHidden ? "" : phoneticLabel.stringValue
         let translated = translatedLabel.stringValue
+        let details = (detailsVisible && !detailsLabel.isHidden) ? detailsLabel.stringValue : ""
         let hint = hintLabel.stringValue
+        let more = moreButton.isHidden ? "" : moreButton.title
 
         let originalFont = originalLabel.font ?? NSFont.systemFont(ofSize: 14, weight: .semibold)
         let phoneticFont = phoneticLabel.font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         let translatedFont = translatedLabel.font ?? NSFont.systemFont(ofSize: 14, weight: .regular)
+        let detailsFont = detailsLabel.font ?? NSFont.systemFont(ofSize: 13, weight: .regular)
         let hintFont = hintLabel.font ?? NSFont.systemFont(ofSize: 11, weight: .regular)
+
+        func maxLineWidth(_ text: String, font: NSFont) -> CGFloat {
+            if text.isEmpty { return 0 }
+            let lines = text.split(separator: "\n").map(String.init)
+            return lines.map { ($0 as NSString).size(withAttributes: [.font: font]).width }.max() ?? 0
+        }
 
         let originalSingle = (original as NSString).size(withAttributes: [.font: originalFont]).width
         let phoneticSingle = (phonetic as NSString).size(withAttributes: [.font: phoneticFont]).width
         let translatedSingle = (translated as NSString).size(withAttributes: [.font: translatedFont]).width
+        let detailsSingle = maxLineWidth(details, font: detailsFont)
         let hintSingle = (hint as NSString).size(withAttributes: [.font: hintFont]).width
+        let moreSingle = (more as NSString).size(withAttributes: [.font: hintFont]).width
+        let bottomRowSingle = hintSingle + (moreButton.isHidden ? 0 : (10 + moreSingle))
 
-        let targetWidth = min(maxWidth, max(minWidth, max(originalSingle, phoneticSingle, translatedSingle, hintSingle) + paddingH))
+        let targetWidth = min(maxWidth, max(minWidth, max(originalSingle, phoneticSingle, translatedSingle, detailsSingle, bottomRowSingle) + paddingH))
         let contentWidth = max(80, targetWidth - paddingH)
 
         func height(_ text: String, font: NSFont) -> CGFloat {
+            if text.isEmpty { return 0 }
             let rect = (text as NSString).boundingRect(
                 with: NSSize(width: contentWidth, height: .greatestFiniteMagnitude),
                 options: [.usesLineFragmentOrigin, .usesFontLeading],
@@ -748,12 +906,19 @@ final class QuickTranslateView: NSView {
         let h1 = height(original, font: originalFont)
         let hPh = phonetic.isEmpty ? 0 : height(phonetic, font: phoneticFont)
         let h2 = height(translated, font: translatedFont)
-        let h3 = height(hint, font: hintFont)
-        let lines = phonetic.isEmpty ? 3 : 4
-        let totalSpacing = interSpacing * CGFloat(max(0, lines - 1))
-        let totalH = paddingV + h1 + hPh + h2 + h3 + totalSpacing
+        let hDetails = details.isEmpty ? 0 : height(details, font: detailsFont)
+        let hBottom = height(hint, font: hintFont)
 
-        return NSSize(width: ceil(targetWidth), height: min(280, max(88, totalH)))
+        var visibleBlocks = 1 // original
+        if !phonetic.isEmpty { visibleBlocks += 1 }
+        visibleBlocks += 1 // translated
+        if !details.isEmpty { visibleBlocks += 1 }
+        visibleBlocks += 1 // bottom row
+
+        let totalSpacing = interSpacing * CGFloat(max(0, visibleBlocks - 1))
+        let totalH = paddingV + h1 + hPh + h2 + hDetails + hBottom + totalSpacing
+
+        return NSSize(width: ceil(targetWidth), height: min(360, max(88, totalH)))
     }
 
     override func mouseDown(with event: NSEvent) {

@@ -76,7 +76,15 @@ final class VocabStore {
     }
 
     @discardableResult
-    func upsertItem(type: VocabItemType, front: String, back: String, phonetic: String? = nil, category: String? = nil, source: String? = nil) -> VocabItem {
+    func upsertItem(
+        type: VocabItemType,
+        front: String,
+        back: String,
+        phonetic: String? = nil,
+        category: String? = nil,
+        source: String? = nil,
+        senses: [WordSense]? = nil
+    ) -> VocabItem {
         let key = Self.dedupeKey(type: type, front: front)
         if let idx = data.items.firstIndex(where: { Self.dedupeKey(type: $0.type, front: $0.front) == key }) {
             var item = data.items[idx]
@@ -87,6 +95,9 @@ final class VocabStore {
             if item.category == nil { item.category = category }
             if let s = source, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 item.source = s
+            }
+            if let senses, !senses.isEmpty {
+                item.senses = senses
             }
             data.items[idx] = item
             save()
@@ -101,6 +112,7 @@ final class VocabStore {
             phonetic: phonetic,
             category: category,
             source: source,
+            senses: senses,
             examples: [],
             createdAt: Date(),
             lastShownAt: nil,
