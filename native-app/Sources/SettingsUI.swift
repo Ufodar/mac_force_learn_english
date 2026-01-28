@@ -30,6 +30,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
 
     var onConfigChanged: (() -> Void)?
     var onRequestQuickTranslateNow: (() -> Void)?
+    var onOpenWordbook: (() -> Void)?
 
     init() {
         let window = NSWindow(
@@ -96,6 +97,9 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         let copyDiagnosticsButton = NSButton(title: "Copy Diagnostics", target: self, action: #selector(onCopyDiagnostics))
         copyDiagnosticsButton.bezelStyle = .rounded
 
+        let openWordbookButton = NSButton(title: "Open Wordbook", target: self, action: #selector(onOpenWordbookClicked))
+        openWordbookButton.bezelStyle = .rounded
+
         let form = NSStackView()
         form.orientation = .vertical
         form.alignment = .leading
@@ -157,7 +161,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         diagButtonsRow1.alignment = .centerY
         diagButtonsRow1.spacing = 12
 
-        let diagButtonsRow2 = NSStackView(views: [tryQuickTranslateButton, copyDiagnosticsButton])
+        let diagButtonsRow2 = NSStackView(views: [tryQuickTranslateButton, copyDiagnosticsButton, openWordbookButton])
         diagButtonsRow2.orientation = .horizontal
         diagButtonsRow2.alignment = .centerY
         diagButtonsRow2.spacing = 12
@@ -291,6 +295,10 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
         pb.clearContents()
         pb.setString(diagnosticsLabel.stringValue, forType: .string)
         statusLabel.stringValue = "Diagnostics copied."
+    }
+
+    @objc private func onOpenWordbookClicked() {
+        onOpenWordbook?()
     }
 
     @objc private func onToggleLLM() {

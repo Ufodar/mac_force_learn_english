@@ -27,6 +27,11 @@ final class LLMClient {
         var exampleZh: String?
     }
 
+    struct WordLookupPayload: Codable {
+        var phonetic: String?
+        var meaning: String
+    }
+
     private let config: AppConfig
     private let decoder = JSONDecoder()
 
@@ -179,12 +184,52 @@ final class LLMClient {
         throw LLMError.invalidResponse("cannot parse translation")
     }
 
+    func lookupWord(_ word: String, target: String) async throws -> WordLookupPayload {
+        guard !config.llmEndpointEffective.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
+
+        let to = target.lowercased() == "zh" ? "中文" : "英文"
+        let prompt = """
+        你是英语词典。请给单词 \"\(word)\" 提供 IPA 音标 + \(to)释义（简洁，1-2 行）。
+        输出必须是严格 JSON（不要 Markdown，不要额外文本），格式如下：
+        {"phonetic":"/IPA/","meaning":"..."}
+        要求：
+        - phonetic 必须是 IPA，形如 /.../
+        - meaning 不要包含 IPA
+        """
+
+        let maxAttempts = 4
+        for attempt in 1...maxAttempts {
+            let content: String
+            do {
+                content = try await requestLLM(prompt: prompt, attempt: attempt)
+            } catch {
+                if attempt == maxAttempts { throw error }
+                continue
+            }
+
+            if let payload: WordLookupPayload = parseJSON(content, as: WordLookupPayload.self),
+               !payload.meaning.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return WordLookupPayload(
+                    phonetic: payload.phonetic?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    meaning: payload.meaning.trimmingCharacters(in: .whitespacesAndNewlines)
+                )
+            }
+        }
+
+        throw LLMError.invalidResponse("cannot parse word lookup")
+    }
+
     private func parsePayload(from content: String) -> GeneratedItemPayload? {
+        parseJSON(content, as: GeneratedItemPayload.self)
+    }
+
+    private func parseJSON<T: Decodable>(_ content: String, as type: T.Type) -> T? {
         let trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
 
         if let data = trimmed.data(using: .utf8),
-           let payload = try? decoder.decode(GeneratedItemPayload.self, from: data) {
-            return payload
+           let obj = try? decoder.decode(T.self, from: data) {
+            return obj
         }
 
         // 容错：尝试从文本中截取第一个 {...} JSON
@@ -192,8 +237,8 @@ final class LLMClient {
            let end = trimmed.lastIndex(of: "}") {
             let sub = String(trimmed[start...end])
             if let data = sub.data(using: .utf8),
-               let payload = try? decoder.decode(GeneratedItemPayload.self, from: data) {
-                return payload
+               let obj = try? decoder.decode(T.self, from: data) {
+                return obj
             }
         }
         return nil

@@ -18,6 +18,8 @@ struct VocabItem: Codable, Hashable, Identifiable {
     var back: String
     var phonetic: String?
     var category: String?
+    /// "lookup" etc. Optional for backward compatibility.
+    var source: String? = nil
     var examples: [VocabExample]
     var createdAt: Date
     var lastShownAt: Date?
@@ -35,4 +37,3 @@ enum OverlayMode {
     case review
     case manual
 }
-

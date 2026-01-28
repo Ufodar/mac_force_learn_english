@@ -1,5 +1,9 @@
 import Foundation
 
+extension Notification.Name {
+    static let vocabStoreDidChange = Notification.Name("MacForceLearnEnglish.VocabStoreDidChange")
+}
+
 final class VocabStore {
     private let fileURL: URL
     private let encoder: JSONEncoder
@@ -32,6 +36,7 @@ final class VocabStore {
         do {
             let bytes = try encoder.encode(data)
             try bytes.write(to: fileURL, options: [.atomic])
+            NotificationCenter.default.post(name: .vocabStoreDidChange, object: self)
         } catch {
             NSLog("[store] save failed: \(error)")
         }
@@ -71,7 +76,7 @@ final class VocabStore {
     }
 
     @discardableResult
-    func upsertItem(type: VocabItemType, front: String, back: String, phonetic: String? = nil, category: String? = nil) -> VocabItem {
+    func upsertItem(type: VocabItemType, front: String, back: String, phonetic: String? = nil, category: String? = nil, source: String? = nil) -> VocabItem {
         let key = Self.dedupeKey(type: type, front: front)
         if let idx = data.items.firstIndex(where: { Self.dedupeKey(type: $0.type, front: $0.front) == key }) {
             var item = data.items[idx]
@@ -80,6 +85,9 @@ final class VocabStore {
                 item.phonetic = p
             }
             if item.category == nil { item.category = category }
+            if let s = source, !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                item.source = s
+            }
             data.items[idx] = item
             save()
             return item
@@ -92,6 +100,7 @@ final class VocabStore {
             back: back,
             phonetic: phonetic,
             category: category,
+            source: source,
             examples: [],
             createdAt: Date(),
             lastShownAt: nil,

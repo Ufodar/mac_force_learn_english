@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let overlay = OverlayController()
     private let settingsWC = SettingsWindowController()
     private lazy var quickTranslate = QuickTranslateController(store: store, llm: llm)
+    private lazy var wordbookWC = WordbookWindowController(store: store)
 
     private var statusItem: NSStatusItem!
     private var timer: Timer?
@@ -27,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         settingsWC.onRequestQuickTranslateNow = { [weak self] in
             self?.quickTranslate.debugShowStatus()
+        }
+        settingsWC.onOpenWordbook = { [weak self] in
+            self?.wordbookWC.show()
         }
 
         restartTimer()
@@ -103,6 +107,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Do Not Disturb", action: #selector(onToggleDND), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quick Translate", action: #selector(onToggleQuickTranslate), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Quick Translate Status", action: #selector(onQuickTranslateStatus), keyEquivalent: ""))
+        menu.addItem(NSMenuItem(title: "Wordbook", action: #selector(onWordbook), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Settings…", action: #selector(onSettings), keyEquivalent: ""))
         menu.addItem(NSMenuItem(title: "Stats", action: #selector(onStats), keyEquivalent: ""))
         menu.addItem(NSMenuItem.separator())
@@ -271,6 +276,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func onQuickTranslateStatus() {
         quickTranslate.debugShowStatus()
+    }
+
+    @objc private func onWordbook() {
+        wordbookWC.show()
     }
 
     @objc private func onSettings() { settingsWC.show() }
