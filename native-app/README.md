@@ -55,10 +55,10 @@ xcrun notarytool store-credentials "MacForceLearnEnglish-notary" \
 NOTARY_PROFILE="MacForceLearnEnglish-notary" NOTARIZE=1 bash native-app/scripts/dist.sh
 ```
 
-另外，为了避免出现多个 `.app` 拷贝导致你误打开到 build 目录（从而权限对不上），你也可以在打包后清理 build 产物：
+另外，为了避免出现多个 `.app` 拷贝导致你误打开到 build 目录（从而权限对不上），`dist.sh` 默认会清理 build 产物；如果你想保留 build 产物用于本地运行：
 
 ```bash
-CLEAN_BUILD_APP=1 bash native-app/scripts/dist.sh
+KEEP_BUILD_APP=1 bash native-app/scripts/dist.sh
 ```
 
 ## 功能入口

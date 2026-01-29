@@ -11,7 +11,9 @@ if [[ "${NOTARIZE:-}" == "1" ]]; then
   bash "$ROOT_DIR/scripts/notarize.sh" "$ROOT_DIR/dist/$APP_NAME.dmg"
 fi
 
-if [[ "${CLEAN_BUILD_APP:-}" == "1" ]]; then
+# Default: clean build artifacts to avoid duplicate app copies / permission mismatch.
+# Set KEEP_BUILD_APP=1 if you want to keep build/ MacForceLearnEnglish.app for local runs.
+if [[ "${KEEP_BUILD_APP:-}" != "1" && "${CLEAN_BUILD_APP:-}" != "0" ]]; then
   rm -rf "$ROOT_DIR/build/$APP_NAME.app" "$ROOT_DIR/build/$APP_NAME"
 fi
 

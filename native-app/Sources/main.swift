@@ -364,6 +364,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let path = Bundle.main.bundlePath
         let bundleId = Bundle.main.bundleIdentifier ?? ""
 
+        if path.hasPrefix("/Applications/") { return }
+
         var copies: [String] = []
         if !bundleId.isEmpty {
             var error: Unmanaged<CFError>?
@@ -372,21 +374,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
 
+        let preferredAppPath = "/Applications/MacForceLearnEnglish.app"
+        let preferredExists = FileManager.default.fileExists(atPath: preferredAppPath)
         let multipleCopies = copies.count > 1
-        let notInApplications = !path.hasPrefix("/Applications/")
-        if !notInApplications, !multipleCopies { return }
 
         let alert = NSAlert()
-        alert.messageText = notInApplications
-            ? "Move MacForceLearnEnglish.app to /Applications"
-            : "Multiple copies of this app found"
+        alert.messageText = preferredExists
+            ? "Open the copy in /Applications"
+            : "Move MacForceLearnEnglish.app to /Applications"
 
         var info = ""
-        if notInApplications {
-            info += "You are running from:\n\(path)\n\n"
-            info += "macOS permissions (Accessibility / Input Monitoring) may keep prompting or not work if you run from a DMG/Downloads/build folder.\n\n"
-            info += "Note: if this app is built from source without a signing identity (ad-hoc signature), macOS may treat each rebuild as a new app and require re-granting permissions. A stable code signature (Developer ID / local Code Signing cert) avoids this.\n\n"
-        }
+        info += "You are running from:\n\(path)\n\n"
+        info += "macOS permissions (Accessibility / Input Monitoring) may keep prompting or not work if you run from a DMG/Downloads/build folder.\n\n"
+        info += "Note: if this app is built from source without a signing identity (ad-hoc signature), macOS may treat each rebuild as a new app and require re-granting permissions. A stable code signature (Developer ID / local Code Signing cert) avoids this.\n\n"
         if multipleCopies {
             info += "Copies detected (\(copies.count)):\n"
             info += copies.prefix(6).joined(separator: "\n")
@@ -395,12 +395,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         alert.informativeText = info.trimmingCharacters(in: .whitespacesAndNewlines)
-        alert.addButton(withTitle: "Open /Applications")
-        alert.addButton(withTitle: "Continue")
+        if preferredExists {
+            alert.addButton(withTitle: "Open /Applications Copy")
+            alert.addButton(withTitle: "Open /Applications Folder")
+            alert.addButton(withTitle: "Continue Here")
 
-        let res = alert.runModal()
-        if res == .alertFirstButtonReturn {
-            NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications", isDirectory: true))
+            let res = alert.runModal()
+            if res == .alertFirstButtonReturn {
+                let url = URL(fileURLWithPath: preferredAppPath, isDirectory: true)
+                let cfg = NSWorkspace.OpenConfiguration()
+                NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, _ in
+                    DispatchQueue.main.async {
+                        NSApp.terminate(nil)
+                    }
+                }
+            } else if res == .alertSecondButtonReturn {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications", isDirectory: true))
+            }
+        } else {
+            alert.addButton(withTitle: "Open /Applications")
+            alert.addButton(withTitle: "Continue")
+
+            let res = alert.runModal()
+            if res == .alertFirstButtonReturn {
+                NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications", isDirectory: true))
+            }
         }
     }
 }
