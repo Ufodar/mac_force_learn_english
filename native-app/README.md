@@ -41,6 +41,20 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
 CODESIGN_IDENTITY="YOUR SIGNING IDENTITY" bash native-app/scripts/dist.sh
 ```
 
+如果你有 Apple Developer Program，并想分发给别人使用（无需手动 `xattr`，权限也更稳定），建议走 Developer ID + Notarization：
+
+```bash
+# 1) 用 Developer ID 签名（hardened runtime + timestamp 会自动启用）
+CODESIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" bash native-app/scripts/dist.sh
+
+# 2) 一次性存凭据（App-Specific Password）
+xcrun notarytool store-credentials "MacForceLearnEnglish-notary" \
+  --apple-id "you@example.com" --team-id "TEAMID" --password "xxxx-xxxx-xxxx-xxxx"
+
+# 3) Notarize + Staple（可直接 NOTARIZE=1 一步完成）
+NOTARY_PROFILE="MacForceLearnEnglish-notary" NOTARIZE=1 bash native-app/scripts/dist.sh
+```
+
 另外，为了避免出现多个 `.app` 拷贝导致你误打开到 build 目录（从而权限对不上），你也可以在打包后清理 build 产物：
 
 ```bash

@@ -30,7 +30,12 @@ cp "$ROOT_DIR/Resources/Info.plist" "$APP_DIR/Contents/Info.plist"
 if [[ -n "$CODESIGN_IDENTITY" ]]; then
   echo "[build] codesigning .app..."
   # A stable signature avoids macOS (TCC) treating each rebuild as a new app and re-prompting for permissions.
-  /usr/bin/codesign --force --deep --sign "$CODESIGN_IDENTITY" "$APP_DIR"
+  SIGN_ARGS=(/usr/bin/codesign --force --deep --sign "$CODESIGN_IDENTITY")
+  # Notarization requires hardened runtime + timestamp (Developer ID).
+  if [[ "$CODESIGN_IDENTITY" == "Developer ID Application"* ]]; then
+    SIGN_ARGS+=(--options runtime --timestamp)
+  fi
+  "${SIGN_ARGS[@]}" "$APP_DIR"
   /usr/bin/codesign --verify --deep --strict "$APP_DIR"
 fi
 
