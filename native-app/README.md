@@ -41,6 +41,12 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
 CODESIGN_IDENTITY="YOUR SIGNING IDENTITY" bash native-app/scripts/dist.sh
 ```
 
+另外，为了避免出现多个 `.app` 拷贝导致你误打开到 build 目录（从而权限对不上），你也可以在打包后清理 build 产物：
+
+```bash
+CLEAN_BUILD_APP=1 bash native-app/scripts/dist.sh
+```
+
 ## 功能入口
 
 - 菜单栏图标：`EN`
