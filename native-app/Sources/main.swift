@@ -385,6 +385,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if notInApplications {
             info += "You are running from:\n\(path)\n\n"
             info += "macOS permissions (Accessibility / Input Monitoring) may keep prompting or not work if you run from a DMG/Downloads/build folder.\n\n"
+            info += "Note: if this app is built from source without a signing identity (ad-hoc signature), macOS may treat each rebuild as a new app and require re-granting permissions. A stable code signature (Developer ID / local Code Signing cert) avoids this.\n\n"
         }
         if multipleCopies {
             info += "Copies detected (\(copies.count)):\n"

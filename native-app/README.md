@@ -28,6 +28,19 @@ sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
 
 3) 打开 App（首次打开建议先去 Settings 填 LLM 配置）
 
+## 关于「每次更新都要重新授权 Accessibility / Input Monitoring」
+
+如果你从源码构建（默认是 ad-hoc 签名），macOS 会把辅助功能/输入监控权限绑定到二进制的 `cdhash`，**每次重新编译都会变**，因此看起来像是“每次更新都要重新给权限”。要让权限能稳定保留，需要给 App 做一个**稳定的代码签名**：
+
+- 推荐：使用 Apple Developer 账号的 `Developer ID Application` 证书（可用于分发，权限也更稳定）
+- 仅本机自用：可以在「钥匙串访问」里创建一个本地 `Code Signing` 证书，然后用同一个证书给每次构建产物签名
+
+本项目支持在构建时可选签名（如果你已经有证书）：
+
+```bash
+CODESIGN_IDENTITY="YOUR SIGNING IDENTITY" bash native-app/scripts/dist.sh
+```
+
 ## 功能入口
 
 - 菜单栏图标：`EN`
