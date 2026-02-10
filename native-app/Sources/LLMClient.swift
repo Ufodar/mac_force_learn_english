@@ -151,27 +151,46 @@ final class LLMClient {
         guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
 
         let to = target.lowercased() == "zh" ? "中文" : "英文"
+        let translateSystemPrompt = "You are a precise translation engine. Do not add, explain, expand, or omit meaning. Output JSON only."
+        let maxTokens = max(220, min(1200, text.count * 2))
         let prompt = """
-        请把下面的文本翻译成\(to)，输出必须是严格 JSON（不要 Markdown，不要额外文本）：
+        你是严谨翻译器。请把给定文本翻译成\(to)。
+        输出必须是严格 JSON（不要 Markdown，不要额外文本）：
         {"translation":"..."}
 
-        文本：
+        硬性规则（必须遵守）：
+        1) 只翻译，不解释，不扩展，不补全，不续写，不举例。
+        2) 不新增原文没有的信息；不改变事实、语气、时态、主语。
+        3) 原文若是不完整片段/短语/标题，译文也保持片段，不补成完整句。
+        4) 保留专有名词、数字、URL、代码标记与换行结构（除非直译必需微调）。
+        5) 不要输出“翻译：/Translation:”等标签。
+
+        待翻译文本（仅翻译此段）：
+        <<<SOURCE>>>
         \(text)
+        <<<END_SOURCE>>>
         """
 
         let maxAttempts = 4
         for attempt in 1...maxAttempts {
             let content: String
             do {
-                content = try await requestLLM(prompt: prompt, attempt: attempt)
+                content = try await requestLLM(
+                    prompt: prompt,
+                    attempt: attempt,
+                    temperature: 0.1,
+                    maxTokens: maxTokens,
+                    systemPrompt: translateSystemPrompt
+                )
             } catch {
                 if attempt == maxAttempts { throw error }
                 continue
             }
 
             if let obj = try? decoder.decode([String: String].self, from: Data(content.utf8)),
-               let t = obj["translation"], !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                return t.trimmingCharacters(in: .whitespacesAndNewlines)
+               let t = obj["translation"] {
+                let cleaned = normalizeTranslationText(t)
+                if !cleaned.isEmpty { return cleaned }
             }
 
             // 容错：尝试从文本中截取第一个 {...} JSON
@@ -180,8 +199,9 @@ final class LLMClient {
                let end = trimmed.lastIndex(of: "}") {
                 let sub = String(trimmed[start...end])
                 if let obj = try? decoder.decode([String: String].self, from: Data(sub.utf8)),
-                   let t = obj["translation"], !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    return t.trimmingCharacters(in: .whitespacesAndNewlines)
+                   let t = obj["translation"] {
+                    let cleaned = normalizeTranslationText(t)
+                    if !cleaned.isEmpty { return cleaned }
                 }
             }
         }
@@ -295,21 +315,71 @@ final class LLMClient {
         return nil
     }
 
-    private func requestLLM(prompt: String, attempt: Int) async throws -> String {
+    private func normalizeTranslationText(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+
+        if s.hasPrefix("```"), let firstNL = s.firstIndex(of: "\n"), let lastFence = s.range(of: "```", options: .backwards) {
+            let body = s[s.index(after: firstNL)..<lastFence.lowerBound]
+            s = String(body).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        let prefixes = ["翻译：", "译文：", "中文：", "英文：", "translation:", "Translation:"]
+        for p in prefixes {
+            if s.hasPrefix(p) {
+                s = String(s.dropFirst(p.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
+
+        if (s.hasPrefix("\"") && s.hasSuffix("\"")) || (s.hasPrefix("“") && s.hasSuffix("”")) {
+            s = String(s.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return s
+    }
+
+    private func requestLLM(
+        prompt: String,
+        attempt: Int,
+        temperature: Double = 0.7,
+        maxTokens: Int = 300,
+        systemPrompt: String = "You are a helpful assistant. Output JSON only."
+    ) async throws -> String {
         let endpoint = config.llmEndpointEffective
         guard let primaryURL = URL(string: endpoint) else { throw LLMError.invalidURL(endpoint) }
 
         do {
-            return try await requestLLM(at: primaryURL, prompt: prompt, attempt: attempt)
+            return try await requestLLM(
+                at: primaryURL,
+                prompt: prompt,
+                attempt: attempt,
+                temperature: temperature,
+                maxTokens: maxTokens,
+                systemPrompt: systemPrompt
+            )
         } catch let LLMError.httpError(code, _) where code == 404 || code == 405 {
             if let altURL = alternateCompletionsURL(from: primaryURL) {
-                return try await requestLLM(at: altURL, prompt: prompt, attempt: attempt)
+                return try await requestLLM(
+                    at: altURL,
+                    prompt: prompt,
+                    attempt: attempt,
+                    temperature: temperature,
+                    maxTokens: maxTokens,
+                    systemPrompt: systemPrompt
+                )
             }
             throw LLMError.httpError(code, "endpoint not found")
         }
     }
 
-    private func requestLLM(at url: URL, prompt: String, attempt: Int) async throws -> String {
+    private func requestLLM(
+        at url: URL,
+        prompt: String,
+        attempt: Int,
+        temperature: Double,
+        maxTokens: Int,
+        systemPrompt: String
+    ) async throws -> String {
         var request = URLRequest(url: url, timeoutInterval: 30)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -323,18 +393,18 @@ final class LLMClient {
             body = [
                 "model": config.llmModelEffective,
                 "messages": [
-                    ["role": "system", "content": "You are a helpful assistant. Output JSON only."],
+                    ["role": "system", "content": systemPrompt],
                     ["role": "user", "content": prompt],
                 ],
-                "temperature": 0.7,
-                "max_tokens": 300,
+                "temperature": temperature,
+                "max_tokens": max(80, maxTokens),
             ]
         } else {
             body = [
                 "model": config.llmModelEffective,
                 "prompt": prompt,
-                "temperature": 0.7,
-                "max_tokens": 300,
+                "temperature": temperature,
+                "max_tokens": max(80, maxTokens),
             ]
         }
 
