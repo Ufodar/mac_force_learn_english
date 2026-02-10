@@ -1039,8 +1039,8 @@ final class QuickTranslateView: NSView {
         configureSelectableTextField(translatedLabel)
         translatedLabel.font = NSFont.systemFont(ofSize: 14, weight: .regular)
         translatedLabel.textColor = .labelColor
-        translatedLabel.maximumNumberOfLines = 8
-        translatedLabel.lineBreakMode = .byWordWrapping
+        translatedLabel.maximumNumberOfLines = 0
+        translatedLabel.lineBreakMode = .byCharWrapping
 
         configureSelectableTextField(detailsLabel)
         detailsLabel.font = NSFont.systemFont(ofSize: 13, weight: .regular)
@@ -1107,7 +1107,7 @@ final class QuickTranslateView: NSView {
     func render(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?, llmUsed: Bool?) {
         originalLabel.stringValue = original
         setPhonetic(phonetic)
-        translatedLabel.stringValue = translated
+        translatedLabel.stringValue = formattedTranslatedText(translated, isWord: isWord)
         self.isWord = isWord
         self.senses = senses ?? []
         setLLMUsed(llmUsed)
@@ -1170,6 +1170,68 @@ final class QuickTranslateView: NSView {
         field.drawsBackground = false
         field.usesSingleLineMode = false
         field.focusRingType = .none
+        field.lineBreakMode = .byWordWrapping
+        if let cell = field.cell as? NSTextFieldCell {
+            cell.wraps = true
+            cell.isScrollable = false
+            cell.usesSingleLineMode = false
+            cell.lineBreakMode = field.lineBreakMode
+        }
+    }
+
+    private func formattedTranslatedText(_ text: String, isWord: Bool) -> String {
+        var out = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        out = out.trimmingCharacters(in: .whitespacesAndNewlines)
+        if out.isEmpty { return out }
+        if isWord { return out }
+
+        out = out.replacingOccurrences(of: "[ \\t]*\\n[ \\t]*", with: "\n", options: .regularExpression)
+
+        // For long single-paragraph translations, split by punctuation first.
+        if !out.contains("\n"), out.count >= 90 {
+            out = out.replacingOccurrences(of: "([。！？；])", with: "$1\n", options: .regularExpression)
+            out = out.replacingOccurrences(of: "([.!?;])\\s+", with: "$1\n", options: .regularExpression)
+        }
+
+        // Still one long line: hard-wrap by character count for readability.
+        if !out.contains("\n"), out.count >= 140 {
+            out = wrapLongLine(out, limit: containsCJK(out) ? 26 : 68)
+        }
+
+        out = out.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+        return out
+    }
+
+    private func wrapLongLine(_ text: String, limit: Int) -> String {
+        guard limit >= 8 else { return text }
+        var result = ""
+        var count = 0
+        for ch in text {
+            result.append(ch)
+            if ch == "\n" {
+                count = 0
+                continue
+            }
+            count += 1
+            if count >= limit {
+                if ch != " " {
+                    result.append("\n")
+                }
+                count = 0
+            }
+        }
+        return result
+    }
+
+    private func containsCJK(_ text: String) -> Bool {
+        for scalar in text.unicodeScalars {
+            switch scalar.value {
+            case 0x4E00...0x9FFF: return true
+            case 0x3400...0x4DBF: return true
+            default: continue
+            }
+        }
+        return false
     }
 
     private func updateMoreButtonVisibility() {
@@ -1269,7 +1331,7 @@ final class QuickTranslateView: NSView {
         let totalSpacing = interSpacing * CGFloat(max(0, visibleBlocks - 1))
         let totalH = paddingV + h1 + hPh + h2 + hDetails + hBottom + totalSpacing
 
-        return NSSize(width: ceil(targetWidth), height: min(360, max(88, totalH)))
+        return NSSize(width: ceil(targetWidth), height: min(560, max(88, totalH)))
     }
 
 }
