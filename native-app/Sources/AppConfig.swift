@@ -93,6 +93,17 @@ final class AppConfig {
         set { defaults.set(newValue, forKey: "quickTranslate.saveToWordbook") }
     }
 
+    /// Hard cap for selection length to avoid accidentally sending huge text to LLM.
+    /// Set via UserDefaults key: `quickTranslate.maxChars`.
+    var quickTranslateMaxSelectionChars: Int {
+        get {
+            let v = defaults.integer(forKey: "quickTranslate.maxChars")
+            if v <= 0 { return 1200 }
+            return max(20, min(v, 20_000))
+        }
+        set { defaults.set(newValue, forKey: "quickTranslate.maxChars") }
+    }
+
     var wordWeight: Int {
         get {
             let v = defaults.integer(forKey: "mix.wordWeight")

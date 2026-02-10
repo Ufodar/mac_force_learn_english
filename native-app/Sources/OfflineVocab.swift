@@ -34,6 +34,9 @@ actor OfflineVocabProvider {
     private var categoryByFile: [URL: String] = [:]
     private var entriesCache: [URL: [Entry]] = [:]
     private var lookupIndex: [String: (category: String, file: URL, idx: Int)] = [:]
+    private var sentenceLookupIndex: [String: (category: String, file: URL, entryIdx: Int, sentenceIdx: Int)] = [:]
+    private var scannedFiles: Set<URL> = []
+    private var fullyScannedFiles = false
 
     init(config: AppConfig = .shared) {
         self.config = config
@@ -95,6 +98,9 @@ actor OfflineVocabProvider {
     func lookupWord(_ word: String) async -> LookupResult? {
         await ensureIndex()
         let key = normalizeWord(word)
+        if lookupIndex[key] == nil {
+            await ensureLookupCandidateLoaded(wordKey: key, sentenceKey: nil)
+        }
         guard let loc = lookupIndex[key] else { return nil }
         guard let entries = try? await loadEntries(for: loc.file),
               loc.idx >= 0, loc.idx < entries.count else { return nil }
@@ -103,6 +109,35 @@ actor OfflineVocabProvider {
         let senses = item.senses ?? []
         let ex = item.examples.last
         return LookupResult(word: item.front, phonetic: item.phonetic, meaning: item.back, senses: senses, example: ex)
+    }
+
+    func lookupSentence(_ sentence: String) async -> VocabItem? {
+        await ensureIndex()
+        let keys = sentenceLookupKeys(sentence)
+        if keys.isEmpty { return nil }
+
+        var loc: (category: String, file: URL, entryIdx: Int, sentenceIdx: Int)?
+        for key in keys {
+            if let hit = sentenceLookupIndex[key] {
+                loc = hit
+                break
+            }
+        }
+        if loc == nil {
+            for key in keys {
+                await ensureLookupCandidateLoaded(wordKey: nil, sentenceKey: key)
+                if let hit = sentenceLookupIndex[key] {
+                    loc = hit
+                    break
+                }
+            }
+        }
+        guard let loc else { return nil }
+        guard let entries = try? await loadEntries(for: loc.file),
+              loc.entryIdx >= 0, loc.entryIdx < entries.count else { return nil }
+        let entry = entries[loc.entryIdx]
+        guard let sentences = entry.sentences, loc.sentenceIdx >= 0, loc.sentenceIdx < sentences.count else { return nil }
+        return makeSentenceItem(from: sentences[loc.sentenceIdx], category: loc.category)
     }
 
     private func ensureIndex() async {
@@ -140,19 +175,24 @@ actor OfflineVocabProvider {
     }
 
     private func loadEntries(for url: URL) async throws -> [Entry] {
-        if let cached = entriesCache[url] { return cached }
+        if let cached = entriesCache[url] {
+            scannedFiles.insert(url)
+            return cached
+        }
 
         let data = try Data(contentsOf: url)
 
         if let arr = try? decoder.decode([Entry].self, from: data) {
             entriesCache[url] = arr
             indexEntries(arr, file: url)
+            scannedFiles.insert(url)
             return arr
         }
         if let single = try? decoder.decode(Entry.self, from: data) {
             let arr = [single]
             entriesCache[url] = arr
             indexEntries(arr, file: url)
+            scannedFiles.insert(url)
             return arr
         }
 
@@ -165,10 +205,43 @@ actor OfflineVocabProvider {
         guard let cat = categoryByFile[file] else { return }
         for (idx, e) in entries.enumerated() {
             let w = normalizeWord(e.word)
-            if w.isEmpty { continue }
-            if lookupIndex[w] != nil { continue }
-            lookupIndex[w] = (category: cat, file: file, idx: idx)
+            if !w.isEmpty, lookupIndex[w] == nil {
+                lookupIndex[w] = (category: cat, file: file, idx: idx)
+            }
+            if let sentences = e.sentences {
+                for (sidx, s) in sentences.enumerated() {
+                    for key in sentenceLookupKeys(s.sentence) {
+                        if key.isEmpty { continue }
+                        if sentenceLookupIndex[key] != nil { continue }
+                        sentenceLookupIndex[key] = (category: cat, file: file, entryIdx: idx, sentenceIdx: sidx)
+                    }
+                }
+            }
         }
+    }
+
+    private func ensureLookupCandidateLoaded(wordKey: String?, sentenceKey: String?) async {
+        if let wordKey, lookupIndex[wordKey] != nil { return }
+        if let sentenceKey, sentenceLookupIndex[sentenceKey] != nil { return }
+        if fullyScannedFiles { return }
+
+        for file in allFiles() {
+            if scannedFiles.contains(file) { continue }
+            _ = try? await loadEntries(for: file)
+            scannedFiles.insert(file)
+            if let wordKey, lookupIndex[wordKey] != nil { return }
+            if let sentenceKey, sentenceLookupIndex[sentenceKey] != nil { return }
+        }
+
+        fullyScannedFiles = true
+    }
+
+    private func allFiles() -> [URL] {
+        var all: [URL] = []
+        for arr in filesByCategory.values {
+            all.append(contentsOf: arr)
+        }
+        return all.sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     private func makeWordItem(from entry: Entry, category: String) -> VocabItem {
@@ -296,5 +369,27 @@ actor OfflineVocabProvider {
 
     private func normalizeWord(_ s: String) -> String {
         s.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    private func normalizeSentence(_ s: String) -> String {
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return "" }
+        let singleSpaced = t.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return singleSpaced.lowercased()
+    }
+
+    private func sentenceLookupKeys(_ s: String) -> [String] {
+        let base = normalizeSentence(s)
+        if base.isEmpty { return [] }
+
+        var trimSet = CharacterSet.whitespacesAndNewlines
+        trimSet.formUnion(.punctuationCharacters)
+        trimSet.formUnion(.symbols)
+
+        let stripped = base.trimmingCharacters(in: trimSet)
+        if stripped.isEmpty || stripped == base {
+            return [base]
+        }
+        return [base, stripped]
     }
 }

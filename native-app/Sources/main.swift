@@ -9,7 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let offline = OfflineVocabProvider()
     private let overlay = OverlayController()
     private let settingsWC = SettingsWindowController()
-    private lazy var quickTranslate = QuickTranslateController(store: store, llm: llm)
+    private lazy var quickTranslate = QuickTranslateController(store: store, llm: llm, offline: offline)
     private lazy var wordbookWC = WordbookWindowController(store: store)
     private let mainWC = MainWindowController()
 

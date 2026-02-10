@@ -4,6 +4,7 @@ import Cocoa
 
 private let quickTranslateHotKeySignature: OSType = OSType(0x4D464C45) // "MFLE"
 private let quickTranslateHotKeyId: UInt32 = 1
+private let quickTranslateCopyWaitSeconds: CFAbsoluteTime = 2.8
 
 private let quickTranslateHotKeyHandler: EventHandlerUPP = { _, theEvent, userData in
     guard let theEvent, let userData else { return noErr }
@@ -29,6 +30,12 @@ private let quickTranslateHotKeyHandler: EventHandlerUPP = { _, theEvent, userDa
 }
 
 @MainActor
+private final class QuickTranslatePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
 final class QuickTranslateController {
     private var mouseMonitor: Any?
     private var debounceWorkItem: DispatchWorkItem?
@@ -42,6 +49,8 @@ final class QuickTranslateController {
     private var hotKeyHandlerRef: EventHandlerRef?
     private var lastHotKeyAt: CFAbsoluteTime = 0
     private var isFetchingDetails: Bool = false
+    private var outsideClickGlobalMonitor: Any?
+    private var outsideClickLocalMonitor: Any?
 
     private var lastText: String = ""
     private var pendingPollText: String = ""
@@ -50,16 +59,18 @@ final class QuickTranslateController {
 
     private let store: VocabStore
     private let llm: LLMClient
-    private let panel: NSPanel
+    private let offline: OfflineVocabProvider
+    private let panel: QuickTranslatePanel
     private let contentView: QuickTranslateView
 
-    init(store: VocabStore, llm: LLMClient = LLMClient()) {
+    init(store: VocabStore, llm: LLMClient = LLMClient(), offline: OfflineVocabProvider = OfflineVocabProvider()) {
         self.store = store
         self.llm = llm
+        self.offline = offline
 
         self.contentView = QuickTranslateView(frame: NSRect(x: 0, y: 0, width: 360, height: 120))
 
-        let p = NSPanel(
+        let p = QuickTranslatePanel(
             contentRect: contentView.frame,
             styleMask: [.borderless],
             backing: .buffered,
@@ -72,15 +83,13 @@ final class QuickTranslateController {
         p.level = .statusBar
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
         p.ignoresMouseEvents = false
-        p.isMovableByWindowBackground = false
+        p.isMovable = true
+        p.isMovableByWindowBackground = true
         p.contentView = contentView
         p.orderOut(nil)
 
         self.panel = p
 
-        contentView.onDismiss = { [weak self] in
-            self?.hide()
-        }
         contentView.onDetailsToggled = { [weak self] in
             self?.resizeAndReposition()
         }
@@ -142,6 +151,7 @@ final class QuickTranslateController {
         stopPolling()
         tearDownEventTap()
         tearDownHotKey()
+        removeOutsideDismissMonitors()
         hide()
     }
 
@@ -153,11 +163,40 @@ final class QuickTranslateController {
         guard AppConfig.shared.quickTranslateEnabled else { return }
         guard shouldHandleNow() else { return }
 
-        guard let text = fetchSelectedText().map(normalizeSelectionForLookup), isReasonable(text) else {
+        guard let raw = fetchSelectedText() else {
+            let selectionExists = hasSelectionViaAccessibility()
+            show(
+                original: selectionExists ? "Selection unavailable" : "No selection",
+                phonetic: nil,
+                translated: selectionExists
+                    ? "Selected text could not be captured (often when content is too large). Try a shorter snippet, then press ⌘⌥P again."
+                    : "Select a word/sentence first, then press ⌘⌥P",
+                isWord: false,
+                senses: nil,
+                llmUsed: false
+            )
+            return
+        }
+
+        let text = normalizeSelectionForLookup(raw)
+        if text.isEmpty {
             show(
                 original: "No selection",
                 phonetic: nil,
                 translated: "Select a word/sentence first, then press ⌘⌥P",
+                isWord: false,
+                senses: nil,
+                llmUsed: false
+            )
+            return
+        }
+
+        let limit = AppConfig.shared.quickTranslateMaxSelectionChars
+        if text.count > limit {
+            show(
+                original: "Selection too long",
+                phonetic: nil,
+                translated: "Selected text is \(text.count) chars (limit \(limit)). Select a shorter snippet.",
                 isWord: false,
                 senses: nil,
                 llmUsed: false
@@ -221,6 +260,8 @@ final class QuickTranslateController {
             do {
                 let target = resolveTargetLanguage(for: text)
                 let kind = inferItemType(from: text)
+                let preferOffline = AppConfig.shared.offlineEnabled && target == "zh"
+                let llmReady = isLLMReady()
 
                 // Word: prefer IPA lookup + cache
                 if kind == .word, isEnglishWord(text) {
@@ -247,6 +288,45 @@ final class QuickTranslateController {
                         await MainActor.run {
                             self.show(original: text, phonetic: nil, translated: "Looking up…", isWord: true, senses: nil, llmUsed: nil)
                         }
+                    }
+
+                    if preferOffline, let offlineResult = await offline.lookupWord(text) {
+                        if Task.isCancelled { return }
+                        await MainActor.run {
+                            self.show(
+                                original: text,
+                                phonetic: offlineResult.phonetic,
+                                translated: offlineResult.meaning,
+                                isWord: true,
+                                senses: offlineResult.senses,
+                                llmUsed: false
+                            )
+                        }
+                        _ = saveLookupIfEnabled(
+                            itemType: .word,
+                            front: text,
+                            back: offlineResult.meaning,
+                            phonetic: offlineResult.phonetic,
+                            senses: offlineResult.senses,
+                            source: "offline",
+                            countAsShown: (cached == nil)
+                        )
+                        return
+                    }
+
+                    if !llmReady {
+                        if Task.isCancelled { return }
+                        await MainActor.run {
+                            self.show(
+                                original: text,
+                                phonetic: cached?.phonetic,
+                                translated: "Offline dictionary has no match and LLM is not configured.",
+                                isWord: true,
+                                senses: cached?.senses,
+                                llmUsed: false
+                            )
+                        }
+                        return
                     }
 
                     didUseLLM = true
@@ -281,6 +361,38 @@ final class QuickTranslateController {
                     return
                 }
 
+                if preferOffline, let sentence = await offline.lookupSentence(text) {
+                    if Task.isCancelled { return }
+                    await MainActor.run {
+                        self.show(original: text, phonetic: nil, translated: sentence.back, isWord: false, senses: nil, llmUsed: false)
+                    }
+                    _ = saveLookupIfEnabled(
+                        itemType: kind,
+                        front: text,
+                        back: sentence.back,
+                        phonetic: nil,
+                        senses: nil,
+                        source: "offline",
+                        countAsShown: true
+                    )
+                    return
+                }
+
+                if !llmReady {
+                    if Task.isCancelled { return }
+                    await MainActor.run {
+                        self.show(
+                            original: text,
+                            phonetic: nil,
+                            translated: "Offline dictionary has no match and LLM is not configured.",
+                            isWord: false,
+                            senses: nil,
+                            llmUsed: false
+                        )
+                    }
+                    return
+                }
+
                 await MainActor.run { self.show(original: text, phonetic: nil, translated: "Translating…", isWord: false, senses: nil, llmUsed: nil) }
                 didUseLLM = true
                 let translated = try await llm.translate(text: text, target: target)
@@ -312,6 +424,7 @@ final class QuickTranslateController {
         lastAnchorPoint = NSEvent.mouseLocation
         resizeAndReposition()
         panel.orderFrontRegardless()
+        installOutsideDismissMonitors()
     }
 
     private func resizeAndReposition() {
@@ -342,6 +455,7 @@ final class QuickTranslateController {
     }
 
     private func hide() {
+        removeOutsideDismissMonitors()
         panel.orderOut(nil)
     }
 
@@ -363,7 +477,7 @@ final class QuickTranslateController {
     private func isReasonable(_ text: String) -> Bool {
         let trimmed = normalizeText(text)
         if trimmed.isEmpty { return false }
-        if trimmed.count > 200 { return false }
+        if trimmed.count > AppConfig.shared.quickTranslateMaxSelectionChars { return false }
         return true
     }
 
@@ -372,7 +486,11 @@ final class QuickTranslateController {
             let t = normalizeText(s)
             return t.isEmpty ? nil : t
         }
-        if let s = fetchSelectedTextViaCopyPreservingClipboard() {
+        if let s = fetchSelectedTextViaCopyPreservingClipboard(maxWaitSeconds: quickTranslateCopyWaitSeconds) {
+            let t = normalizeText(s)
+            return t.isEmpty ? nil : t
+        }
+        if let s = fetchSelectedTextViaCopyPreservingClipboard(maxWaitSeconds: quickTranslateCopyWaitSeconds + 1.6) {
             let t = normalizeText(s)
             return t.isEmpty ? nil : t
         }
@@ -386,10 +504,31 @@ final class QuickTranslateController {
         guard okFocused == .success, let focused else { return nil }
 
         var selected: CFTypeRef?
-        let okSelected = AXUIElementCopyAttributeValue(focused as! AXUIElement, kAXSelectedTextAttribute as CFString, &selected)
-        guard okSelected == .success else { return nil }
+        let element = focused as! AXUIElement
+        let okSelected = AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selected)
+        if okSelected == .success, let s = selected as? String, !s.isEmpty { return s }
 
-        if let s = selected as? String, !s.isEmpty { return s }
+        // Some apps expose range but not kAXSelectedTextAttribute.
+        var rangeRef: CFTypeRef?
+        let okRange = AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef)
+        if okRange == .success, let rangeRef {
+            let rangeValue = rangeRef as! AXValue
+            var range = CFRange(location: 0, length: 0)
+            let hasRange = withUnsafeMutablePointer(to: &range) { ptr in
+                AXValueGetValue(rangeValue, .cfRange, UnsafeMutableRawPointer(ptr))
+            }
+            if hasRange, range.length > 0 {
+                var out: CFTypeRef?
+                let okParam = AXUIElementCopyParameterizedAttributeValue(
+                    element,
+                    kAXStringForRangeParameterizedAttribute as CFString,
+                    rangeValue,
+                    &out
+                )
+                if okParam == .success, let s = out as? String, !s.isEmpty { return s }
+            }
+        }
+
         return nil
     }
 
@@ -422,7 +561,7 @@ final class QuickTranslateController {
         }
     }
 
-    private func fetchSelectedTextViaCopyPreservingClipboard() -> String? {
+    private func fetchSelectedTextViaCopyPreservingClipboard(maxWaitSeconds: CFAbsoluteTime = quickTranslateCopyWaitSeconds) -> String? {
         guard AXIsProcessTrusted() else { return nil }
 
         let pb = NSPasteboard.general
@@ -431,14 +570,58 @@ final class QuickTranslateController {
 
         sendCopyShortcut()
 
-        for _ in 0..<14 {
-            if pb.changeCount != before { break }
-            usleep(25_000)
+        let deadline = CFAbsoluteTimeGetCurrent() + max(0.4, maxWaitSeconds)
+        while pb.changeCount == before, CFAbsoluteTimeGetCurrent() < deadline {
+            usleep(20_000)
         }
 
-        let text = pb.string(forType: .string)
+        guard pb.changeCount != before else {
+            snapshot.restore(to: pb)
+            return nil
+        }
+
+        var text = pb.string(forType: .string)
+        if (text ?? "").isEmpty {
+            let settleDeadline = CFAbsoluteTimeGetCurrent() + 0.35
+            while (text ?? "").isEmpty, CFAbsoluteTimeGetCurrent() < settleDeadline {
+                usleep(20_000)
+                text = pb.string(forType: .string)
+            }
+        }
         snapshot.restore(to: pb)
         return text
+    }
+
+    private func hasSelectionViaAccessibility() -> Bool {
+        guard AXIsProcessTrusted() else { return false }
+
+        let system = AXUIElementCreateSystemWide()
+        var focused: CFTypeRef?
+        let okFocused = AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &focused)
+        guard okFocused == .success, let focused else { return false }
+        let element = focused as! AXUIElement
+
+        var selected: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSelectedTextAttribute as CFString, &selected) == .success,
+           let s = selected as? String,
+           !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            return true
+        }
+
+        var rangeRef: CFTypeRef?
+        if AXUIElementCopyAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, &rangeRef) == .success,
+           let rangeRef {
+            let rangeValue = rangeRef as! AXValue
+            var range = CFRange(location: 0, length: 0)
+            let hasRange = withUnsafeMutablePointer(to: &range) { ptr in
+                AXValueGetValue(rangeValue, .cfRange, UnsafeMutableRawPointer(ptr))
+            }
+            if hasRange, range.length > 0 {
+                return true
+            }
+        }
+
+        return false
     }
 
     private func sendCopyShortcut() {
@@ -579,10 +762,15 @@ final class QuickTranslateController {
 
     private func normalizeSelectionForLookup(_ text: String) -> String {
         let normalized = normalizeText(text)
+        if normalized.isEmpty { return "" }
         var trimSet = CharacterSet.whitespacesAndNewlines
         trimSet.formUnion(.punctuationCharacters)
         trimSet.formUnion(.symbols)
-        return normalized.trimmingCharacters(in: trimSet)
+        let maybeWord = normalized.trimmingCharacters(in: trimSet)
+        if isEnglishWord(maybeWord) {
+            return maybeWord
+        }
+        return normalized.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func inferItemType(from text: String) -> VocabItemType {
@@ -597,12 +785,69 @@ final class QuickTranslateController {
     }
 
     @discardableResult
-    private func saveLookupIfEnabled(itemType: VocabItemType, front: String, back: String, phonetic: String?, countAsShown: Bool) -> VocabItem? {
+    private func saveLookupIfEnabled(
+        itemType: VocabItemType,
+        front: String,
+        back: String,
+        phonetic: String?,
+        senses: [WordSense]? = nil,
+        source: String = "lookup",
+        countAsShown: Bool
+    ) -> VocabItem? {
         guard AppConfig.shared.quickTranslateSaveToWordbook else { return nil }
-        let item = store.upsertItem(type: itemType, front: front, back: back, phonetic: phonetic, category: "lookup", source: "lookup", senses: nil)
+        let item = store.upsertItem(
+            type: itemType,
+            front: front,
+            back: back,
+            phonetic: phonetic,
+            category: "lookup",
+            source: source,
+            senses: senses
+        )
         guard countAsShown else { return item }
         let countedAsNewWord = (item.type == .word && item.timesShown == 0)
         return store.recordShown(item, countedAsNewWord: countedAsNewWord)
+    }
+
+    private func isLLMReady() -> Bool {
+        if !AppConfig.shared.llmEnabled { return false }
+        if AppConfig.shared.llmEndpointEffective.isEmpty { return false }
+        if AppConfig.shared.llmModelEffective.isEmpty { return false }
+        return true
+    }
+
+    private func installOutsideDismissMonitors() {
+        removeOutsideDismissMonitors()
+
+        outsideClickLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            guard let self else { return event }
+            if event.window === self.panel {
+                return event
+            }
+            self.hide()
+            return event
+        }
+
+        outsideClickGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            guard let self else { return }
+            let p = NSEvent.mouseLocation
+            if !self.panel.frame.contains(p) {
+                Task { @MainActor in
+                    self.hide()
+                }
+            }
+        }
+    }
+
+    private func removeOutsideDismissMonitors() {
+        if let m = outsideClickLocalMonitor {
+            NSEvent.removeMonitor(m)
+        }
+        outsideClickLocalMonitor = nil
+        if let m = outsideClickGlobalMonitor {
+            NSEvent.removeMonitor(m)
+        }
+        outsideClickGlobalMonitor = nil
     }
 
     private func setupEventTapIfPossible() {
@@ -741,15 +986,14 @@ final class QuickTranslateController {
 
 final class QuickTranslateView: NSView {
     private let card = NSView()
-    private let originalLabel = NSTextField(labelWithString: "")
-    private let phoneticLabel = NSTextField(labelWithString: "")
-    private let translatedLabel = NSTextField(labelWithString: "")
-    private let detailsLabel = NSTextField(wrappingLabelWithString: "")
+    private let originalLabel = NSTextField(string: "")
+    private let phoneticLabel = NSTextField(string: "")
+    private let translatedLabel = NSTextField(string: "")
+    private let detailsLabel = NSTextField(string: "")
     private let hintLabel = NSTextField(labelWithString: "")
     private let llmStatusLabel = NSTextField(labelWithString: "")
     private let moreButton = NSButton(title: "More", target: nil, action: nil)
 
-    var onDismiss: (() -> Void)?
     var onDetailsToggled: (() -> Void)?
     var onRequestMoreMeanings: (() -> Void)?
 
@@ -758,6 +1002,8 @@ final class QuickTranslateView: NSView {
     private var senses: [WordSense] = []
     private var detailsVisible: Bool = false
     private var lastKey: String = ""
+
+    override var mouseDownCanMoveWindow: Bool { true }
 
     private func applyCardColors() {
         // Note: converting dynamic system colors to CGColor freezes them; refresh on appearance changes.
@@ -778,21 +1024,25 @@ final class QuickTranslateView: NSView {
         card.layer?.borderWidth = 1
         applyCardColors()
 
+        configureSelectableTextField(originalLabel)
         originalLabel.font = NSFont.systemFont(ofSize: 14, weight: .semibold)
         originalLabel.textColor = .labelColor
         originalLabel.maximumNumberOfLines = 4
         originalLabel.lineBreakMode = .byWordWrapping
 
+        configureSelectableTextField(phoneticLabel)
         phoneticLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
         phoneticLabel.textColor = .secondaryLabelColor
         phoneticLabel.maximumNumberOfLines = 1
         phoneticLabel.isHidden = true
 
+        configureSelectableTextField(translatedLabel)
         translatedLabel.font = NSFont.systemFont(ofSize: 14, weight: .regular)
         translatedLabel.textColor = .labelColor
         translatedLabel.maximumNumberOfLines = 8
         translatedLabel.lineBreakMode = .byWordWrapping
 
+        configureSelectableTextField(detailsLabel)
         detailsLabel.font = NSFont.systemFont(ofSize: 13, weight: .regular)
         detailsLabel.textColor = .labelColor
         detailsLabel.maximumNumberOfLines = 12
@@ -802,7 +1052,7 @@ final class QuickTranslateView: NSView {
         hintLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         hintLabel.textColor = .secondaryLabelColor
         hintLabel.maximumNumberOfLines = 1
-        hintLabel.stringValue = "Click to dismiss"
+        hintLabel.stringValue = "Drag to move · click outside to close"
 
         llmStatusLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         llmStatusLabel.maximumNumberOfLines = 1
@@ -913,6 +1163,15 @@ final class QuickTranslateView: NSView {
         }
     }
 
+    private func configureSelectableTextField(_ field: NSTextField) {
+        field.isEditable = false
+        field.isSelectable = true
+        field.isBordered = false
+        field.drawsBackground = false
+        field.usesSingleLineMode = false
+        field.focusRingType = .none
+    }
+
     private func updateMoreButtonVisibility() {
         moreButton.isHidden = !isWord
         moreButton.title = detailsVisible ? "Less" : "More"
@@ -1013,7 +1272,4 @@ final class QuickTranslateView: NSView {
         return NSSize(width: ceil(targetWidth), height: min(360, max(88, totalH)))
     }
 
-    override func mouseDown(with event: NSEvent) {
-        onDismiss?()
-    }
 }

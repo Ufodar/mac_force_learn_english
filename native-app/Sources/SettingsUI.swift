@@ -477,6 +477,7 @@ final class SettingsWindowController: NSWindowController, NSWindowDelegate {
             "App: \(bundlePath)",
             "Bundle: \(bundleId) v\(version) (\(build))",
             "Accessibility: \(ax ? "OK" : "NO")    Input Monitoring: \(listen ? "OK" : "NO")",
+            "Quick Translate max chars: \(AppConfig.shared.quickTranslateMaxSelectionChars)",
             offlineLine,
             "Offline folder exists: \(offlineExists ? "YES" : "NO")",
             "Installed in /Applications: \(inApplications ? "YES" : "NO")",
