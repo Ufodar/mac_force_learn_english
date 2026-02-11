@@ -291,6 +291,52 @@ final class LLMClient {
         throw LLMError.invalidResponse("cannot parse word details")
     }
 
+    func ask(selection: String, question: String) async throws -> String {
+        guard !config.llmEndpointEffective.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
+
+        let systemPrompt = """
+        You are a helpful assistant.
+        - Answer in the same language as the user's question.
+        - Be concise unless the user asks for detail.
+        - Use plain text (no JSON).
+        """
+
+        let prompt = """
+        用户问题：
+        \(question)
+
+        选中的文字：
+        <<<SELECTION>>>
+        \(selection)
+        <<<END_SELECTION>>>
+
+        请结合「用户问题」与「选中的文字」给出回复。
+        """
+
+        let maxAttempts = 3
+        for attempt in 1...maxAttempts {
+            let content: String
+            do {
+                content = try await requestLLM(
+                    prompt: prompt,
+                    attempt: attempt,
+                    temperature: 0.3,
+                    maxTokens: 700,
+                    systemPrompt: systemPrompt
+                )
+            } catch {
+                if attempt == maxAttempts { throw error }
+                continue
+            }
+
+            let cleaned = normalizeAssistantText(content)
+            if !cleaned.isEmpty { return cleaned }
+        }
+
+        throw LLMError.invalidResponse("empty response")
+    }
+
     private func parsePayload(from content: String) -> GeneratedItemPayload? {
         parseJSON(content, as: GeneratedItemPayload.self)
     }
@@ -335,6 +381,31 @@ final class LLMClient {
         if (s.hasPrefix("\"") && s.hasSuffix("\"")) || (s.hasPrefix("“") && s.hasSuffix("”")) {
             s = String(s.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        return s
+    }
+
+    private func normalizeAssistantText(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+
+        if s.hasPrefix("```"),
+           let firstNL = s.firstIndex(of: "\n"),
+           let lastFence = s.range(of: "```", options: .backwards),
+           lastFence.lowerBound > firstNL {
+            let body = s[s.index(after: firstNL)..<lastFence.lowerBound]
+            s = String(body).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        // If the model still outputs JSON, try to extract a common answer field.
+        if let data = s.data(using: .utf8),
+           let obj = try? decoder.decode([String: String].self, from: data) {
+            for key in ["answer", "response", "content", "text"] {
+                if let v = obj[key]?.trimmingCharacters(in: .whitespacesAndNewlines), !v.isEmpty {
+                    return v
+                }
+            }
+        }
+
         return s
     }
 

@@ -4,7 +4,8 @@ import Carbon.HIToolbox
 import Cocoa
 
 private let quickTranslateHotKeySignature: OSType = OSType(0x4D464C45) // "MFLE"
-private let quickTranslateHotKeyId: UInt32 = 1
+private let quickTranslateTranslateHotKeyId: UInt32 = 1
+private let quickTranslateAskHotKeyId: UInt32 = 2
 private let quickTranslateCopyWaitSeconds: CFAbsoluteTime = 2.8
 
 private let quickTranslateHotKeyHandler: EventHandlerUPP = { _, theEvent, userData in
@@ -21,17 +22,30 @@ private let quickTranslateHotKeyHandler: EventHandlerUPP = { _, theEvent, userDa
         &hkID
     )
     if err != noErr { return noErr }
-    if hkID.signature != quickTranslateHotKeySignature || hkID.id != quickTranslateHotKeyId { return noErr }
+    if hkID.signature != quickTranslateHotKeySignature { return noErr }
 
     let controller = Unmanaged<QuickTranslateController>.fromOpaque(userData).takeUnretainedValue()
     Task { @MainActor in
-        controller.translateSelectionNow()
+        switch hkID.id {
+        case quickTranslateTranslateHotKeyId:
+            controller.translateSelectionNow()
+        case quickTranslateAskHotKeyId:
+            controller.askSelectionNow()
+        default:
+            break
+        }
     }
     return noErr
 }
 
 @MainActor
 private final class QuickTranslatePanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+}
+
+@MainActor
+private final class QuickAskPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
 }
@@ -46,16 +60,24 @@ final class QuickTranslateController {
     private var eventTapSource: CFRunLoopSource?
     private var lastEnsureAttemptAt: CFAbsoluteTime = 0
     private var didShowPermissionHint: Bool = false
-    private var hotKeyRef: EventHotKeyRef?
+    private var translateHotKeyRef: EventHotKeyRef?
+    private var askHotKeyRef: EventHotKeyRef?
     private var hotKeyHandlerRef: EventHandlerRef?
-    private var lastHotKeyAt: CFAbsoluteTime = 0
+    private var lastTranslateHotKeyAt: CFAbsoluteTime = 0
+    private var lastAskHotKeyAt: CFAbsoluteTime = 0
     private var isFetchingDetails: Bool = false
     private var outsideClickGlobalMonitor: Any?
     private var outsideClickLocalMonitor: Any?
+    private var askOutsideClickGlobalMonitor: Any?
+    private var askOutsideClickLocalMonitor: Any?
+    private var askKeyLocalMonitor: Any?
 
     private var lastText: String = ""
     private var pendingPollText: String = ""
     private var lastAnchorPoint: NSPoint = .zero
+    private var pendingAskSelection: String = ""
+    private var askAnchorPoint: NSPoint = .zero
+    private var askPreviousApp: NSRunningApplication?
     private var currentLookupWord: String?
     private var currentOriginalForSpeech: String = ""
     private var currentTranslatedForSpeech: String = ""
@@ -66,44 +88,76 @@ final class QuickTranslateController {
     private let speechSynth = AVSpeechSynthesizer()
     private let panel: QuickTranslatePanel
     private let contentView: QuickTranslateView
+    private let askPanel: QuickAskPanel
+    private let askView: QuickAskView
 
     init(store: VocabStore, llm: LLMClient = LLMClient(), offline: OfflineVocabProvider = OfflineVocabProvider()) {
         self.store = store
         self.llm = llm
         self.offline = offline
 
-        self.contentView = QuickTranslateView(frame: NSRect(x: 0, y: 0, width: 360, height: 120))
+        let bubbleView = QuickTranslateView(frame: NSRect(x: 0, y: 0, width: 360, height: 120))
+        self.contentView = bubbleView
 
-        let p = QuickTranslatePanel(
-            contentRect: contentView.frame,
+        let bubblePanel = QuickTranslatePanel(
+            contentRect: bubbleView.frame,
             styleMask: [.borderless],
             backing: .buffered,
             defer: false
         )
-        p.isOpaque = false
-        p.backgroundColor = .clear
-        p.hasShadow = true
-        p.hidesOnDeactivate = false
-        p.level = .statusBar
-        p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
-        p.ignoresMouseEvents = false
-        p.isMovable = true
-        p.isMovableByWindowBackground = true
-        p.contentView = contentView
-        p.orderOut(nil)
+        bubblePanel.isOpaque = false
+        bubblePanel.backgroundColor = .clear
+        bubblePanel.hasShadow = true
+        bubblePanel.hidesOnDeactivate = false
+        bubblePanel.level = .statusBar
+        bubblePanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        bubblePanel.ignoresMouseEvents = false
+        bubblePanel.isMovable = true
+        bubblePanel.isMovableByWindowBackground = true
+        bubblePanel.contentView = bubbleView
+        bubblePanel.orderOut(nil)
 
-        self.panel = p
+        self.panel = bubblePanel
 
-        contentView.onDetailsToggled = { [weak self] in
+        let askView = QuickAskView(frame: NSRect(x: 0, y: 0, width: 420, height: 148))
+        self.askView = askView
+
+        let askPanel = QuickAskPanel(
+            contentRect: askView.frame,
+            styleMask: [.borderless],
+            backing: .buffered,
+            defer: false
+        )
+        askPanel.isOpaque = false
+        askPanel.backgroundColor = .clear
+        askPanel.hasShadow = true
+        askPanel.hidesOnDeactivate = false
+        askPanel.level = .statusBar
+        askPanel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .transient]
+        askPanel.ignoresMouseEvents = false
+        askPanel.isMovable = true
+        askPanel.isMovableByWindowBackground = true
+        askPanel.contentView = askView
+        askPanel.orderOut(nil)
+        self.askPanel = askPanel
+
+        bubbleView.onDetailsToggled = { [weak self] in
             self?.resizeAndReposition()
         }
-        contentView.onRequestMoreMeanings = { [weak self] in
+        bubbleView.onRequestMoreMeanings = { [weak self] in
             Task { @MainActor in
                 await self?.fetchMoreMeaningsIfNeeded()
             }
         }
-        contentView.onSpeakRequested = { [weak self] in
+        bubbleView.onSpeakRequested = { [weak self] in
             self?.speakCurrent()
+        }
+
+        askView.onCancel = { [weak self] in
+            self?.hideAskPanel(restoreFocus: true)
+        }
+        askView.onSubmit = { [weak self] prompt in
+            self?.submitAsk(prompt: prompt)
         }
     }
 
@@ -126,17 +180,17 @@ final class QuickTranslateController {
         }
 
         requestAccessibilityPromptIfNeeded()
+        setupHotKeyIfNeeded()
 
         if AppConfig.shared.quickTranslateTrigger.lowercased() == "auto" {
             requestInputMonitoringPromptIfNeeded()
             ensureMonitors(throttled: false)
             startPolling()
         } else {
-            setupHotKeyIfNeeded()
             show(
                 original: "Quick Translate",
                 phonetic: nil,
-                translated: "Select text then press ⌘⌥P",
+                translated: "Select text then press ⌘⌥P (translate) or ⌘⌥0 (ask)",
                 isWord: false,
                 senses: nil,
                 llmUsed: false
@@ -162,13 +216,14 @@ final class QuickTranslateController {
         tearDownEventTap()
         tearDownHotKey()
         removeOutsideDismissMonitors()
+        hideAskPanel(restoreFocus: false)
         hide()
     }
 
     func translateSelectionNow() {
         let now = CFAbsoluteTimeGetCurrent()
-        if now - lastHotKeyAt < 0.25 { return }
-        lastHotKeyAt = now
+        if now - lastTranslateHotKeyAt < 0.25 { return }
+        lastTranslateHotKeyAt = now
 
         guard AppConfig.shared.quickTranslateEnabled else { return }
         guard shouldHandleNow() else { return }
@@ -217,6 +272,73 @@ final class QuickTranslateController {
         Task { @MainActor in
             await self.handleTrigger(text: text, allowDuplicate: true)
         }
+    }
+
+    func askSelectionNow() {
+        let now = CFAbsoluteTimeGetCurrent()
+        if now - lastAskHotKeyAt < 0.25 { return }
+        lastAskHotKeyAt = now
+
+        guard AppConfig.shared.quickTranslateEnabled else { return }
+        guard shouldHandleNow() else { return }
+
+        guard isLLMReady() else {
+            show(
+                original: "LLM not configured",
+                phonetic: nil,
+                translated: "Open Settings… and set endpoint/model/apiKey first.",
+                isWord: false,
+                senses: nil,
+                llmUsed: false
+            )
+            return
+        }
+
+        guard let raw = fetchSelectedText() else {
+            let selectionExists = hasSelectionViaAccessibility()
+            show(
+                original: selectionExists ? "Selection unavailable" : "No selection",
+                phonetic: nil,
+                translated: selectionExists
+                    ? "Selected text could not be captured. Try a shorter snippet, then press ⌘⌥0 again."
+                    : "Select text first, then press ⌘⌥0",
+                isWord: false,
+                senses: nil,
+                llmUsed: false
+            )
+            return
+        }
+
+        let text = normalizeText(raw)
+        if text.isEmpty {
+            show(
+                original: "No selection",
+                phonetic: nil,
+                translated: "Select text first, then press ⌘⌥0",
+                isWord: false,
+                senses: nil,
+                llmUsed: false
+            )
+            return
+        }
+
+        let limit = AppConfig.shared.quickTranslateMaxSelectionChars
+        if text.count > limit {
+            show(
+                original: "Selection too long",
+                phonetic: nil,
+                translated: "Selected text is \(text.count) chars (limit \(limit)). Select a shorter snippet.",
+                isWord: false,
+                senses: nil,
+                llmUsed: false
+            )
+            return
+        }
+
+        askPreviousApp = NSWorkspace.shared.frontmostApplication
+        pendingAskSelection = text
+        askAnchorPoint = NSEvent.mouseLocation
+        showAskPanel()
     }
 
     private func scheduleCheck() {
@@ -427,40 +549,49 @@ final class QuickTranslateController {
         }
     }
 
-    private func show(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?, llmUsed: Bool?) {
+    private func show(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?, llmUsed: Bool?, anchor: NSPoint? = nil) {
         currentLookupWord = (isWord && isEnglishWord(original)) ? original : nil
         currentOriginalForSpeech = original
         currentTranslatedForSpeech = translated
         contentView.render(original: original, phonetic: phonetic, translated: translated, isWord: isWord, senses: senses, llmUsed: llmUsed)
 
-        lastAnchorPoint = NSEvent.mouseLocation
+        lastAnchorPoint = anchor ?? NSEvent.mouseLocation
         resizeAndReposition()
         panel.orderFrontRegardless()
         installOutsideDismissMonitors()
     }
 
     private func resizeAndReposition() {
-        let size = contentView.preferredSize(maxWidth: 520)
-        panel.setContentSize(size)
-
         let anchor = lastAnchorPoint
         let screen = NSScreen.screens.first(where: { $0.frame.contains(anchor) }) ?? NSScreen.main
-        let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let margin: CGFloat = 10
+
+        let availableWidth = max(1, screenFrame.width - margin * 2)
+        let availableHeight = max(1, screenFrame.height - margin * 2)
+        let maxWidth = min(520, availableWidth)
+        var size = contentView.preferredSize(maxWidth: maxWidth)
+        size.width = min(size.width, availableWidth)
+        size.height = min(size.height, availableHeight)
+        panel.setContentSize(size)
 
         var x = anchor.x + 14
         var y = anchor.y - size.height - 14
 
-        if x + size.width > screenFrame.maxX - 10 {
-            x = screenFrame.maxX - size.width - 10
+        if x + size.width > screenFrame.maxX - margin {
+            x = screenFrame.maxX - size.width - margin
         }
-        if x < screenFrame.minX + 10 {
-            x = screenFrame.minX + 10
+        if x < screenFrame.minX + margin {
+            x = screenFrame.minX + margin
         }
-        if y < screenFrame.minY + 10 {
+        if y < screenFrame.minY + margin {
             y = anchor.y + 14
         }
-        if y + size.height > screenFrame.maxY - 10 {
-            y = screenFrame.maxY - size.height - 10
+        if y + size.height > screenFrame.maxY - margin {
+            y = screenFrame.maxY - size.height - margin
+        }
+        if y < screenFrame.minY + margin {
+            y = screenFrame.minY + margin
         }
 
         panel.setFrameOrigin(NSPoint(x: x, y: y))
@@ -470,6 +601,151 @@ final class QuickTranslateController {
         removeOutsideDismissMonitors()
         _ = speechSynth.stopSpeaking(at: .immediate)
         panel.orderOut(nil)
+    }
+
+    private func showAskPanel() {
+        let selection = pendingAskSelection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selection.isEmpty else { return }
+
+        askView.reset(selection: selection)
+        resizeAndRepositionAskPanel()
+        askPanel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+        askView.focusPrompt()
+        installAskDismissMonitors()
+    }
+
+    private func resizeAndRepositionAskPanel() {
+        let anchor = askAnchorPoint == .zero ? NSEvent.mouseLocation : askAnchorPoint
+        let screen = NSScreen.screens.first(where: { $0.frame.contains(anchor) }) ?? NSScreen.main
+        let screenFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1200, height: 800)
+        let margin: CGFloat = 10
+
+        let availableWidth = max(1, screenFrame.width - margin * 2)
+        let availableHeight = max(1, screenFrame.height - margin * 2)
+        let maxWidth = min(560, availableWidth)
+        var size = askView.preferredSize(maxWidth: maxWidth)
+        size.width = min(size.width, availableWidth)
+        size.height = min(size.height, availableHeight)
+        askPanel.setContentSize(size)
+
+        var x = anchor.x + 14
+        var y = anchor.y - size.height - 14
+
+        if x + size.width > screenFrame.maxX - margin {
+            x = screenFrame.maxX - size.width - margin
+        }
+        if x < screenFrame.minX + margin {
+            x = screenFrame.minX + margin
+        }
+        if y < screenFrame.minY + margin {
+            y = anchor.y + 14
+        }
+        if y + size.height > screenFrame.maxY - margin {
+            y = screenFrame.maxY - size.height - margin
+        }
+        if y < screenFrame.minY + margin {
+            y = screenFrame.minY + margin
+        }
+
+        askPanel.setFrameOrigin(NSPoint(x: x, y: y))
+    }
+
+    private func submitAsk(prompt: String) {
+        let question = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        if question.isEmpty {
+            NSSound.beep()
+            askView.focusPrompt()
+            return
+        }
+
+        let selection = pendingAskSelection.trimmingCharacters(in: .whitespacesAndNewlines)
+        if selection.isEmpty {
+            hideAskPanel(restoreFocus: true)
+            return
+        }
+
+        let anchor = askAnchorPoint == .zero ? NSEvent.mouseLocation : askAnchorPoint
+        let prev = askPreviousApp
+        hideAskPanel(restoreFocus: false)
+
+        show(original: selection, phonetic: nil, translated: "Asking…", isWord: false, senses: nil, llmUsed: nil, anchor: anchor)
+        prev?.activate(options: [])
+
+        currentTask?.cancel()
+        currentTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                let answer = try await self.llm.ask(selection: selection, question: question)
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.show(original: selection, phonetic: nil, translated: answer, isWord: false, senses: nil, llmUsed: true, anchor: anchor)
+                }
+            } catch {
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.show(original: selection, phonetic: nil, translated: "Failed: \(error)", isWord: false, senses: nil, llmUsed: true, anchor: anchor)
+                }
+            }
+        }
+    }
+
+    private func hideAskPanel(restoreFocus: Bool) {
+        removeAskDismissMonitors()
+        askPanel.orderOut(nil)
+
+        pendingAskSelection = ""
+        askAnchorPoint = .zero
+        let prev = askPreviousApp
+        askPreviousApp = nil
+        if restoreFocus, let prev {
+            prev.activate(options: [])
+        }
+    }
+
+    private func installAskDismissMonitors() {
+        removeAskDismissMonitors()
+
+        askOutsideClickLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            guard let self else { return event }
+            if event.window === self.askPanel { return event }
+            self.hideAskPanel(restoreFocus: true)
+            return event
+        }
+
+        askOutsideClickGlobalMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            guard let self else { return }
+            let p = NSEvent.mouseLocation
+            if !self.askPanel.frame.contains(p) {
+                Task { @MainActor in
+                    self.hideAskPanel(restoreFocus: true)
+                }
+            }
+        }
+
+        askKeyLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
+            guard let self else { return event }
+            if event.keyCode == 53 { // esc
+                self.hideAskPanel(restoreFocus: true)
+                return nil
+            }
+            return event
+        }
+    }
+
+    private func removeAskDismissMonitors() {
+        if let m = askOutsideClickLocalMonitor {
+            NSEvent.removeMonitor(m)
+        }
+        askOutsideClickLocalMonitor = nil
+        if let m = askOutsideClickGlobalMonitor {
+            NSEvent.removeMonitor(m)
+        }
+        askOutsideClickGlobalMonitor = nil
+        if let m = askKeyLocalMonitor {
+            NSEvent.removeMonitor(m)
+        }
+        askKeyLocalMonitor = nil
     }
 
     private func speakCurrent() {
@@ -755,38 +1031,55 @@ final class QuickTranslateController {
     }
 
     private func setupHotKeyIfNeeded() {
-        guard hotKeyRef == nil else { return }
+        guard translateHotKeyRef == nil || askHotKeyRef == nil else { return }
 
-        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
-        let installStatus = InstallEventHandler(
-            GetApplicationEventTarget(),
-            quickTranslateHotKeyHandler,
-            1,
-            &eventType,
-            Unmanaged.passUnretained(self).toOpaque(),
-            &hotKeyHandlerRef
-        )
-        if installStatus != noErr {
-            NSLog("[quick_translate] InstallEventHandler failed: \(installStatus)")
-            hotKeyHandlerRef = nil
-            return
+        if hotKeyHandlerRef == nil {
+            var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+            let installStatus = InstallEventHandler(
+                GetApplicationEventTarget(),
+                quickTranslateHotKeyHandler,
+                1,
+                &eventType,
+                Unmanaged.passUnretained(self).toOpaque(),
+                &hotKeyHandlerRef
+            )
+            if installStatus != noErr {
+                NSLog("[quick_translate] InstallEventHandler failed: \(installStatus)")
+                hotKeyHandlerRef = nil
+                return
+            }
         }
 
-        let hkID = EventHotKeyID(signature: quickTranslateHotKeySignature, id: quickTranslateHotKeyId)
         let modifiers = UInt32(cmdKey | optionKey)
-        let keyCode = UInt32(kVK_ANSI_P)
-        let registerStatus = RegisterEventHotKey(keyCode, modifiers, hkID, GetApplicationEventTarget(), 0, &hotKeyRef)
-        if registerStatus != noErr {
-            NSLog("[quick_translate] RegisterEventHotKey failed: \(registerStatus)")
-            hotKeyRef = nil
+        if translateHotKeyRef == nil {
+            let hkID = EventHotKeyID(signature: quickTranslateHotKeySignature, id: quickTranslateTranslateHotKeyId)
+            let keyCode = UInt32(kVK_ANSI_P)
+            let registerStatus = RegisterEventHotKey(keyCode, modifiers, hkID, GetApplicationEventTarget(), 0, &translateHotKeyRef)
+            if registerStatus != noErr {
+                NSLog("[quick_translate] RegisterEventHotKey (translate) failed: \(registerStatus)")
+                translateHotKeyRef = nil
+            }
+        }
+        if askHotKeyRef == nil {
+            let hkID = EventHotKeyID(signature: quickTranslateHotKeySignature, id: quickTranslateAskHotKeyId)
+            let keyCode = UInt32(kVK_ANSI_0)
+            let registerStatus = RegisterEventHotKey(keyCode, modifiers, hkID, GetApplicationEventTarget(), 0, &askHotKeyRef)
+            if registerStatus != noErr {
+                NSLog("[quick_translate] RegisterEventHotKey (ask) failed: \(registerStatus)")
+                askHotKeyRef = nil
+            }
         }
     }
 
     private func tearDownHotKey() {
-        if let hk = hotKeyRef {
+        if let hk = translateHotKeyRef {
             UnregisterEventHotKey(hk)
         }
-        hotKeyRef = nil
+        translateHotKeyRef = nil
+        if let hk = askHotKeyRef {
+            UnregisterEventHotKey(hk)
+        }
+        askHotKeyRef = nil
 
         if let h = hotKeyHandlerRef {
             RemoveEventHandler(h)
@@ -1036,6 +1329,141 @@ final class QuickTranslateController {
             }
         }
         return false
+    }
+}
+
+@MainActor
+final class QuickAskView: NSView {
+    private let card = NSView()
+    private let titleLabel = NSTextField(labelWithString: "Ask")
+    private let selectionLabel = NSTextField(labelWithString: "")
+    private let promptField = NSTextField(string: "")
+    private let hintLabel = NSTextField(labelWithString: "")
+    private let cancelButton = NSButton(title: "Cancel", target: nil, action: nil)
+    private let sendButton = NSButton(title: "Send", target: nil, action: nil)
+
+    var onSubmit: ((String) -> Void)?
+    var onCancel: (() -> Void)?
+
+    private func applyCardColors() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            card.layer?.backgroundColor = NSColor.windowBackgroundColor.withAlphaComponent(0.96).cgColor
+            card.layer?.borderColor = NSColor.separatorColor.cgColor
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+
+        wantsLayer = true
+        layer?.backgroundColor = NSColor.clear.cgColor
+
+        card.wantsLayer = true
+        card.layer?.cornerRadius = 12
+        card.layer?.borderWidth = 1
+        applyCardColors()
+
+        titleLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        titleLabel.textColor = .secondaryLabelColor
+        titleLabel.maximumNumberOfLines = 1
+
+        selectionLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
+        selectionLabel.textColor = .secondaryLabelColor
+        selectionLabel.lineBreakMode = .byWordWrapping
+        selectionLabel.maximumNumberOfLines = 3
+
+        promptField.placeholderString = "Ask about the selection…"
+        promptField.font = NSFont.systemFont(ofSize: 14, weight: .regular)
+        promptField.target = self
+        promptField.action = #selector(onSendTriggered)
+
+        hintLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
+        hintLabel.textColor = .tertiaryLabelColor
+        hintLabel.maximumNumberOfLines = 1
+        hintLabel.stringValue = "Enter to send · Esc to cancel"
+
+        cancelButton.bezelStyle = .inline
+        cancelButton.controlSize = .small
+        cancelButton.target = self
+        cancelButton.action = #selector(onCancelClicked)
+
+        sendButton.bezelStyle = .inline
+        sendButton.controlSize = .small
+        sendButton.target = self
+        sendButton.action = #selector(onSendTriggered)
+
+        let spacer = NSView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let bottomRow = NSStackView(views: [hintLabel, spacer, cancelButton, sendButton])
+        bottomRow.orientation = .horizontal
+        bottomRow.alignment = .centerY
+        bottomRow.distribution = .fill
+        bottomRow.spacing = 10
+
+        let stack = NSStackView(views: [titleLabel, selectionLabel, promptField, bottomRow])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.distribution = .fill
+        stack.spacing = 10
+        stack.translatesAutoresizingMaskIntoConstraints = false
+
+        card.addSubview(stack)
+        addSubview(card)
+
+        card.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            card.leadingAnchor.constraint(equalTo: leadingAnchor),
+            card.trailingAnchor.constraint(equalTo: trailingAnchor),
+            card.topAnchor.constraint(equalTo: topAnchor),
+            card.bottomAnchor.constraint(equalTo: bottomAnchor),
+
+            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 14),
+            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -14),
+            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
+            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
+        ])
+    }
+
+    required init?(coder: NSCoder) { nil }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        applyCardColors()
+    }
+
+    func reset(selection: String) {
+        titleLabel.stringValue = "Ask (⌘⌥0)"
+        selectionLabel.stringValue = formatSelectionPreview(selection)
+        promptField.stringValue = ""
+        promptField.placeholderString = "Type your question…"
+    }
+
+    func focusPrompt() {
+        window?.makeFirstResponder(promptField)
+    }
+
+    func preferredSize(maxWidth: CGFloat) -> NSSize {
+        let targetWidth = max(1, min(maxWidth, 560))
+        return NSSize(width: ceil(targetWidth), height: 156)
+    }
+
+    private func formatSelectionPreview(_ text: String) -> String {
+        var s = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        s = s.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.count > 240 {
+            s = String(s.prefix(240)) + "…"
+        }
+        return "Selected: \(s)"
+    }
+
+    @objc private func onCancelClicked() {
+        onCancel?()
+    }
+
+    @objc private func onSendTriggered() {
+        onSubmit?(promptField.stringValue)
     }
 }
 
