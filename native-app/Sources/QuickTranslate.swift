@@ -1,4 +1,5 @@
 import ApplicationServices
+import AVFoundation
 import Carbon.HIToolbox
 import Cocoa
 
@@ -56,10 +57,13 @@ final class QuickTranslateController {
     private var pendingPollText: String = ""
     private var lastAnchorPoint: NSPoint = .zero
     private var currentLookupWord: String?
+    private var currentOriginalForSpeech: String = ""
+    private var currentTranslatedForSpeech: String = ""
 
     private let store: VocabStore
     private let llm: LLMClient
     private let offline: OfflineVocabProvider
+    private let speechSynth = AVSpeechSynthesizer()
     private let panel: QuickTranslatePanel
     private let contentView: QuickTranslateView
 
@@ -97,6 +101,9 @@ final class QuickTranslateController {
             Task { @MainActor in
                 await self?.fetchMoreMeaningsIfNeeded()
             }
+        }
+        contentView.onSpeakRequested = { [weak self] in
+            self?.speakCurrent()
         }
     }
 
@@ -148,6 +155,9 @@ final class QuickTranslateController {
         currentTask = nil
         isFetchingDetails = false
         currentLookupWord = nil
+        currentOriginalForSpeech = ""
+        currentTranslatedForSpeech = ""
+        _ = speechSynth.stopSpeaking(at: .immediate)
         stopPolling()
         tearDownEventTap()
         tearDownHotKey()
@@ -419,6 +429,8 @@ final class QuickTranslateController {
 
     private func show(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?, llmUsed: Bool?) {
         currentLookupWord = (isWord && isEnglishWord(original)) ? original : nil
+        currentOriginalForSpeech = original
+        currentTranslatedForSpeech = translated
         contentView.render(original: original, phonetic: phonetic, translated: translated, isWord: isWord, senses: senses, llmUsed: llmUsed)
 
         lastAnchorPoint = NSEvent.mouseLocation
@@ -456,7 +468,50 @@ final class QuickTranslateController {
 
     private func hide() {
         removeOutsideDismissMonitors()
+        _ = speechSynth.stopSpeaking(at: .immediate)
         panel.orderOut(nil)
+    }
+
+    private func speakCurrent() {
+        let original = currentOriginalForSpeech.trimmingCharacters(in: .whitespacesAndNewlines)
+        let translated = currentTranslatedForSpeech.trimmingCharacters(in: .whitespacesAndNewlines)
+        if original.isEmpty, translated.isEmpty { return }
+
+        let textToRead: String
+        if containsCJK(original), !translated.isEmpty, !containsCJK(translated) {
+            textToRead = translated
+        } else {
+            textToRead = original.isEmpty ? translated : original
+        }
+        if textToRead.isEmpty { return }
+
+        if speechSynth.isSpeaking {
+            _ = speechSynth.stopSpeaking(at: .immediate)
+        }
+        let utterance = AVSpeechUtterance(string: textToRead)
+        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+        if let voice = bestVoice(for: textToRead) {
+            utterance.voice = voice
+        }
+        speechSynth.speak(utterance)
+    }
+
+    private func bestVoice(for text: String) -> AVSpeechSynthesisVoice? {
+        let wantZh = containsCJK(text)
+        let voices = AVSpeechSynthesisVoice.speechVoices()
+        let prefixes = wantZh ? ["zh-Hans", "zh-CN", "zh"] : ["en-US", "en-GB", "en"]
+        for p in prefixes {
+            if let v = AVSpeechSynthesisVoice(language: p) { return v }
+        }
+        for v in voices {
+            let locale = v.language
+            if wantZh {
+                if locale.lowercased().hasPrefix("zh") { return v }
+            } else {
+                if locale.lowercased().hasPrefix("en") { return v }
+            }
+        }
+        return voices.first
     }
 
     private func resolveTargetLanguage(for text: String) -> String {
@@ -992,10 +1047,12 @@ final class QuickTranslateView: NSView {
     private let detailsLabel = NSTextField(string: "")
     private let hintLabel = NSTextField(labelWithString: "")
     private let llmStatusLabel = NSTextField(labelWithString: "")
+    private let readButton = NSButton(title: "Read", target: nil, action: nil)
     private let moreButton = NSButton(title: "More", target: nil, action: nil)
 
     var onDetailsToggled: (() -> Void)?
     var onRequestMoreMeanings: (() -> Void)?
+    var onSpeakRequested: (() -> Void)?
 
     private var isWord: Bool = false
     private var llmUsed: Bool?
@@ -1058,6 +1115,12 @@ final class QuickTranslateView: NSView {
         llmStatusLabel.maximumNumberOfLines = 1
         setLLMUsed(false)
 
+        readButton.bezelStyle = .inline
+        readButton.controlSize = .small
+        readButton.target = self
+        readButton.action = #selector(onReadClicked)
+        readButton.isHidden = false
+
         moreButton.bezelStyle = .inline
         moreButton.controlSize = .small
         moreButton.target = self
@@ -1067,7 +1130,7 @@ final class QuickTranslateView: NSView {
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let bottomRow = NSStackView(views: [hintLabel, spacer, llmStatusLabel, moreButton])
+        let bottomRow = NSStackView(views: [hintLabel, spacer, llmStatusLabel, readButton, moreButton])
         bottomRow.orientation = .horizontal
         bottomRow.alignment = .centerY
         bottomRow.distribution = .fill
@@ -1266,6 +1329,10 @@ final class QuickTranslateView: NSView {
         onDetailsToggled?()
     }
 
+    @objc private func onReadClicked() {
+        onSpeakRequested?()
+    }
+
     func preferredSize(maxWidth: CGFloat) -> NSSize {
         let minWidth: CGFloat = 220
         let paddingH: CGFloat = 14 * 2
@@ -1278,6 +1345,7 @@ final class QuickTranslateView: NSView {
         let details = (detailsVisible && !detailsLabel.isHidden) ? detailsLabel.stringValue : ""
         let hint = hintLabel.stringValue
         let llmStatus = llmStatusLabel.stringValue
+        let read = readButton.title
         let more = moreButton.isHidden ? "" : moreButton.title
 
         let originalFont = originalLabel.font ?? NSFont.systemFont(ofSize: 14, weight: .semibold)
@@ -1298,9 +1366,10 @@ final class QuickTranslateView: NSView {
         let detailsSingle = maxLineWidth(details, font: detailsFont)
         let hintSingle = (hint as NSString).size(withAttributes: [.font: hintFont]).width
         let llmSingle = (llmStatus as NSString).size(withAttributes: [.font: hintFont]).width
+        let readSingle = (read as NSString).size(withAttributes: [.font: hintFont]).width
         let moreSingle = (more as NSString).size(withAttributes: [.font: hintFont]).width
-        // bottomRow: hint + spacer + llm + (optional) more
-        let bottomRowSingle = hintSingle + 20 + llmSingle + (moreButton.isHidden ? 0 : (10 + moreSingle))
+        // bottomRow: hint + spacer + llm + read + (optional) more
+        let bottomRowSingle = hintSingle + 20 + llmSingle + 10 + readSingle + (moreButton.isHidden ? 0 : (10 + moreSingle))
 
         let targetWidth = min(maxWidth, max(minWidth, max(originalSingle, phoneticSingle, translatedSingle, detailsSingle, bottomRowSingle) + paddingH))
         let contentWidth = max(80, targetWidth - paddingH)
