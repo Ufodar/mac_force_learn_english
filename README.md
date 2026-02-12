@@ -18,6 +18,14 @@
 1) 在 GitHub Releases 下载 `MacForceLearnEnglish.dmg`  
 2) 打开 DMG，把 `MacForceLearnEnglish.app` 拖到 `/Applications`  
 3) 去掉隔离属性（未签名/未公证的安装方式）：
+```bash
+重置权限（让系统只给 /Applications 那一份重新授权）：避免安装最新版本时授权问题
+tccutil reset Accessibility com.ufodar.macforcelearnenglish
+tccutil reset ListenEvent com.ufodar.macforcelearnenglish
+
+授权
+sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
+```
 
 ```bash
 sudo xattr -rd com.apple.quarantine "/Applications/MacForceLearnEnglish.app"
