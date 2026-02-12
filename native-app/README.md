@@ -67,7 +67,7 @@ KEEP_BUILD_APP=1 bash native-app/scripts/dist.sh
   - Show Now：立刻弹一次
   - Review：进入复习模式（不会自动消失）
   - Do Not Disturb：勿扰（定时弹窗暂停）
-  - Quick Translate：划词翻译/问答（选中文本后按 `⌘⌥P` 翻译；按 `⌘⌥0` 弹出输入框提问；单词会带 IPA；支持 `More` 多释义；气泡点击关闭，不会自动消失）
+  - Quick Translate：划词翻译/问答（选中文本后按 `⌘⌥P` 翻译；按 `⌘⌥0` 弹出输入框提问；长回复自动出现滚动条；单词会带 IPA；支持 `More` 多释义；气泡点击关闭，不会自动消失）
   - Wordbook：单词本（你查过的单词）
   - Settings：配置 LLM/间隔/时长/类别/复习插入规则
   - Stats：简单统计

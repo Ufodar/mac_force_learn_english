@@ -1471,7 +1471,8 @@ final class QuickTranslateView: NSView {
     private let card = NSView()
     private let originalLabel = NSTextField(string: "")
     private let phoneticLabel = NSTextField(string: "")
-    private let translatedLabel = NSTextField(string: "")
+    private let translatedScroll = NSScrollView()
+    private let translatedTextView = NSTextView()
     private let detailsLabel = NSTextField(string: "")
     private let hintLabel = NSTextField(labelWithString: "")
     private let llmStatusLabel = NSTextField(labelWithString: "")
@@ -1521,11 +1522,32 @@ final class QuickTranslateView: NSView {
         phoneticLabel.maximumNumberOfLines = 1
         phoneticLabel.isHidden = true
 
-        configureSelectableTextField(translatedLabel)
-        translatedLabel.font = NSFont.systemFont(ofSize: 14, weight: .regular)
-        translatedLabel.textColor = .labelColor
-        translatedLabel.maximumNumberOfLines = 0
-        translatedLabel.lineBreakMode = .byCharWrapping
+        translatedTextView.isEditable = false
+        translatedTextView.isSelectable = true
+        translatedTextView.isRichText = false
+        translatedTextView.drawsBackground = false
+        translatedTextView.textContainerInset = NSSize(width: 0, height: 0)
+        translatedTextView.font = NSFont.systemFont(ofSize: 14, weight: .regular)
+        translatedTextView.textColor = .labelColor
+        translatedTextView.isVerticallyResizable = true
+        translatedTextView.isHorizontallyResizable = false
+        translatedTextView.autoresizingMask = [.width]
+        translatedTextView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        translatedTextView.textContainer?.widthTracksTextView = true
+        translatedTextView.textContainer?.lineBreakMode = .byCharWrapping
+        translatedTextView.textContainer?.lineFragmentPadding = 0
+
+        translatedScroll.borderType = .noBorder
+        translatedScroll.drawsBackground = false
+        translatedScroll.hasVerticalScroller = true
+        translatedScroll.hasHorizontalScroller = false
+        translatedScroll.autohidesScrollers = true
+        translatedScroll.scrollerStyle = .overlay
+        translatedScroll.documentView = translatedTextView
+        translatedScroll.setContentHuggingPriority(.defaultLow, for: .vertical)
+        translatedScroll.setContentCompressionResistancePriority(.defaultLow, for: .vertical)
+        translatedScroll.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        translatedScroll.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
         configureSelectableTextField(detailsLabel)
         detailsLabel.font = NSFont.systemFont(ofSize: 13, weight: .regular)
@@ -1564,7 +1586,7 @@ final class QuickTranslateView: NSView {
         bottomRow.distribution = .fill
         bottomRow.spacing = 10
 
-        let stack = NSStackView(views: [originalLabel, phoneticLabel, translatedLabel, detailsLabel, bottomRow])
+        let stack = NSStackView(views: [originalLabel, phoneticLabel, translatedScroll, detailsLabel, bottomRow])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.distribution = .fill
@@ -1598,7 +1620,7 @@ final class QuickTranslateView: NSView {
     func render(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?, llmUsed: Bool?) {
         originalLabel.stringValue = original
         setPhonetic(phonetic)
-        translatedLabel.stringValue = formattedTranslatedText(translated, isWord: isWord)
+        setTranslatedText(formattedTranslatedText(translated, isWord: isWord))
         self.isWord = isWord
         self.senses = senses ?? []
         setLLMUsed(llmUsed)
@@ -1668,6 +1690,16 @@ final class QuickTranslateView: NSView {
             cell.usesSingleLineMode = false
             cell.lineBreakMode = field.lineBreakMode
         }
+    }
+
+    private func setTranslatedText(_ text: String) {
+        let font = translatedTextView.font ?? NSFont.systemFont(ofSize: 14, weight: .regular)
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font,
+            .foregroundColor: NSColor.labelColor,
+        ]
+        translatedTextView.textStorage?.setAttributedString(NSAttributedString(string: text, attributes: attrs))
+        translatedTextView.scrollToBeginningOfDocument(nil)
     }
 
     private func formattedTranslatedText(_ text: String, isWord: Bool) -> String {
@@ -1769,7 +1801,7 @@ final class QuickTranslateView: NSView {
 
         let original = originalLabel.stringValue
         let phonetic = phoneticLabel.isHidden ? "" : phoneticLabel.stringValue
-        let translated = translatedLabel.stringValue
+        let translated = translatedTextView.string
         let details = (detailsVisible && !detailsLabel.isHidden) ? detailsLabel.stringValue : ""
         let hint = hintLabel.stringValue
         let llmStatus = llmStatusLabel.stringValue
@@ -1778,7 +1810,7 @@ final class QuickTranslateView: NSView {
 
         let originalFont = originalLabel.font ?? NSFont.systemFont(ofSize: 14, weight: .semibold)
         let phoneticFont = phoneticLabel.font ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
-        let translatedFont = translatedLabel.font ?? NSFont.systemFont(ofSize: 14, weight: .regular)
+        let translatedFont = translatedTextView.font ?? NSFont.systemFont(ofSize: 14, weight: .regular)
         let detailsFont = detailsLabel.font ?? NSFont.systemFont(ofSize: 13, weight: .regular)
         let hintFont = hintLabel.font ?? NSFont.systemFont(ofSize: 11, weight: .regular)
 
@@ -1790,7 +1822,7 @@ final class QuickTranslateView: NSView {
 
         let originalSingle = (original as NSString).size(withAttributes: [.font: originalFont]).width
         let phoneticSingle = (phonetic as NSString).size(withAttributes: [.font: phoneticFont]).width
-        let translatedSingle = (translated as NSString).size(withAttributes: [.font: translatedFont]).width
+        let translatedSingle = maxLineWidth(translated, font: translatedFont)
         let detailsSingle = maxLineWidth(details, font: detailsFont)
         let hintSingle = (hint as NSString).size(withAttributes: [.font: hintFont]).width
         let llmSingle = (llmStatus as NSString).size(withAttributes: [.font: hintFont]).width
@@ -1826,9 +1858,13 @@ final class QuickTranslateView: NSView {
         visibleBlocks += 1 // bottom row
 
         let totalSpacing = interSpacing * CGFloat(max(0, visibleBlocks - 1))
-        let totalH = paddingV + h1 + hPh + h2 + hDetails + hBottom + totalSpacing
+        let maxBubbleHeight: CGFloat = 420
+        let fixedH = paddingV + h1 + hPh + hDetails + hBottom + totalSpacing
+        let maxTranslatedVisible = max(0, maxBubbleHeight - fixedH)
+        let translatedVisible = min(h2, maxTranslatedVisible)
+        let totalH = fixedH + translatedVisible
 
-        return NSSize(width: ceil(targetWidth), height: min(560, max(88, totalH)))
+        return NSSize(width: ceil(targetWidth), height: min(maxBubbleHeight, max(88, totalH)))
     }
 
 }
