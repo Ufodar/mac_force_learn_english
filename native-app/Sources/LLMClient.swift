@@ -17,6 +17,11 @@ enum LLMError: Error, CustomStringConvertible {
 }
 
 final class LLMClient {
+    enum SmartReadMode {
+        case cleanSummary
+        case codeExplain
+    }
+
     struct GeneratedItemPayload: Codable {
         var type: String
         var front: String
@@ -323,6 +328,75 @@ final class LLMClient {
                     attempt: attempt,
                     temperature: 0.3,
                     maxTokens: 700,
+                    systemPrompt: systemPrompt
+                )
+            } catch {
+                if attempt == maxAttempts { throw error }
+                continue
+            }
+
+            let cleaned = normalizeAssistantText(content)
+            if !cleaned.isEmpty { return cleaned }
+        }
+
+        throw LLMError.invalidResponse("empty response")
+    }
+
+    func smartRead(selection: String, mode: SmartReadMode, didTruncate: Bool) async throws -> String {
+        guard !config.llmEndpointEffective.isEmpty else { throw LLMError.missingConfig("endpoint") }
+        guard !config.llmModelEffective.isEmpty else { throw LLMError.missingConfig("model") }
+
+        let systemPrompt = """
+        You are a driving-friendly narrator.
+        - Output plain text only (no JSON, no Markdown).
+        - Make it easy to listen to: short paragraphs, clear transitions.
+        - If content contains code/URLs/logs, do not read them verbatim unless very short and essential.
+        """
+
+        let modeHint: String
+        switch mode {
+        case .cleanSummary:
+            modeHint = """
+            任务：把选中内容改写成“适合开车听”的口播稿。
+            - 优先讲清楚核心观点、结论、关键步骤/要点。
+            - 省略或概括：长代码、堆栈、长命令、长 URL、无意义的符号。
+            - 如果必须提到代码：只保留 1-2 行以内的关键片段，其余用自然语言描述。
+            - 默认时长：约 1-3 分钟的语音长度（内容太长就概括）。
+            """
+        case .codeExplain:
+            modeHint = """
+            任务：把选中代码讲解成“适合开车听”的讲解稿（像你在讲课/讲故事）。
+            - 先一句话说它“整体做什么”。
+            - 再按模块/函数/流程讲清楚：输入→处理→输出，关键状态与边界条件。
+            - 不要逐行朗读代码；最多引用 1-2 行关键代码，其余用自然语言解释。
+            - 如果代码很长：先讲结构，再讲最重要的 3-6 个点。
+            - 默认时长：约 2-5 分钟语音长度。
+            """
+        }
+
+        let truncateHint = didTruncate ? "注意：输入内容已被截断（只看到部分片段），回答时请注明“可能不完整”。" : ""
+
+        let prompt = """
+        \(modeHint)
+        \(truncateHint)
+
+        选中内容：
+        <<<SELECTION>>>
+        \(selection)
+        <<<END_SELECTION>>>
+
+        请直接输出口播稿正文（纯文本）。
+        """
+
+        let maxAttempts = 3
+        for attempt in 1...maxAttempts {
+            let content: String
+            do {
+                content = try await requestLLM(
+                    prompt: prompt,
+                    attempt: attempt,
+                    temperature: 0.2,
+                    maxTokens: 900,
                     systemPrompt: systemPrompt
                 )
             } catch {

@@ -52,6 +52,12 @@ private final class QuickAskPanel: NSPanel {
 
 @MainActor
 final class QuickTranslateController {
+    private enum SpeechPreference {
+        case auto
+        case original
+        case translated
+    }
+
     private var mouseMonitor: Any?
     private var debounceWorkItem: DispatchWorkItem?
     private var currentTask: Task<Void, Never>?
@@ -81,6 +87,7 @@ final class QuickTranslateController {
     private var currentLookupWord: String?
     private var currentOriginalForSpeech: String = ""
     private var currentTranslatedForSpeech: String = ""
+    private var currentSpeechPreference: SpeechPreference = .auto
 
     private let store: VocabStore
     private let llm: LLMClient
@@ -159,6 +166,12 @@ final class QuickTranslateController {
         askView.onSubmit = { [weak self] prompt in
             self?.submitAsk(prompt: prompt)
         }
+        askView.onReadDirect = { [weak self] in
+            self?.readSelectionDirectFromAskPanel()
+        }
+        askView.onReadSmart = { [weak self] in
+            self?.readSelectionSmartFromAskPanel()
+        }
     }
 
     func applyConfig() {
@@ -190,7 +203,7 @@ final class QuickTranslateController {
             show(
                 original: "Quick Translate",
                 phonetic: nil,
-                translated: "Select text then press ⌘⌥P (translate) or ⌘⌥0 (ask)",
+                translated: "Select text then press ⌘⌥P (translate) or ⌘⌥0 (ask/read)",
                 isWord: false,
                 senses: nil,
                 llmUsed: false
@@ -282,19 +295,20 @@ final class QuickTranslateController {
         guard AppConfig.shared.quickTranslateEnabled else { return }
         guard shouldHandleNow() else { return }
 
-        guard isLLMReady() else {
-            show(
-                original: "LLM not configured",
-                phonetic: nil,
-                translated: "Open Settings… and set endpoint/model/apiKey first.",
-                isWord: false,
-                senses: nil,
-                llmUsed: false
-            )
-            return
-        }
-
-        guard let raw = fetchSelectedText() else {
+        guard let raw = fetchSelectedTextForAsk() else {
+            if speechSynth.isSpeaking {
+                _ = speechSynth.stopSpeaking(at: .immediate)
+                show(
+                    original: "Speech",
+                    phonetic: nil,
+                    translated: "Stopped.",
+                    isWord: false,
+                    senses: nil,
+                    llmUsed: false,
+                    speechPreference: .translated
+                )
+                return
+            }
             let selectionExists = hasSelectionViaAccessibility()
             show(
                 original: selectionExists ? "Selection unavailable" : "No selection",
@@ -309,8 +323,21 @@ final class QuickTranslateController {
             return
         }
 
-        let text = normalizeText(raw)
+        let text = raw
         if text.isEmpty {
+            if speechSynth.isSpeaking {
+                _ = speechSynth.stopSpeaking(at: .immediate)
+                show(
+                    original: "Speech",
+                    phonetic: nil,
+                    translated: "Stopped.",
+                    isWord: false,
+                    senses: nil,
+                    llmUsed: false,
+                    speechPreference: .translated
+                )
+                return
+            }
             show(
                 original: "No selection",
                 phonetic: nil,
@@ -322,21 +349,11 @@ final class QuickTranslateController {
             return
         }
 
-        let limit = AppConfig.shared.quickTranslateMaxSelectionChars
-        if text.count > limit {
-            show(
-                original: "Selection too long",
-                phonetic: nil,
-                translated: "Selected text is \(text.count) chars (limit \(limit)). Select a shorter snippet.",
-                isWord: false,
-                senses: nil,
-                llmUsed: false
-            )
-            return
-        }
+        let hardLimit = 80_000
+        let captured = text.count > hardLimit ? String(text.prefix(hardLimit)) : text
 
         askPreviousApp = NSWorkspace.shared.frontmostApplication
-        pendingAskSelection = text
+        pendingAskSelection = captured
         askAnchorPoint = NSEvent.mouseLocation
         showAskPanel()
     }
@@ -549,10 +566,20 @@ final class QuickTranslateController {
         }
     }
 
-    private func show(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?, llmUsed: Bool?, anchor: NSPoint? = nil) {
+    private func show(
+        original: String,
+        phonetic: String?,
+        translated: String,
+        isWord: Bool,
+        senses: [WordSense]?,
+        llmUsed: Bool?,
+        anchor: NSPoint? = nil,
+        speechPreference: SpeechPreference = .auto
+    ) {
         currentLookupWord = (isWord && isEnglishWord(original)) ? original : nil
         currentOriginalForSpeech = original
         currentTranslatedForSpeech = translated
+        currentSpeechPreference = speechPreference
         contentView.render(original: original, phonetic: phonetic, translated: translated, isWord: isWord, senses: senses, llmUsed: llmUsed)
 
         lastAnchorPoint = anchor ?? NSEvent.mouseLocation
@@ -665,11 +692,34 @@ final class QuickTranslateController {
             return
         }
 
+        guard isLLMReady() else {
+            show(
+                original: "LLM not configured",
+                phonetic: nil,
+                translated: "Open Settings… and set endpoint/model/apiKey first.",
+                isWord: false,
+                senses: nil,
+                llmUsed: false,
+                anchor: askAnchorPoint,
+                speechPreference: .translated
+            )
+            return
+        }
+
         let anchor = askAnchorPoint == .zero ? NSEvent.mouseLocation : askAnchorPoint
         let prev = askPreviousApp
         hideAskPanel(restoreFocus: false)
 
-        show(original: selection, phonetic: nil, translated: "Asking…", isWord: false, senses: nil, llmUsed: nil, anchor: anchor)
+        show(
+            original: selection,
+            phonetic: nil,
+            translated: "Asking…",
+            isWord: false,
+            senses: nil,
+            llmUsed: nil,
+            anchor: anchor,
+            speechPreference: .translated
+        )
         prev?.activate(options: [])
 
         currentTask?.cancel()
@@ -679,12 +729,133 @@ final class QuickTranslateController {
                 let answer = try await self.llm.ask(selection: selection, question: question)
                 if Task.isCancelled { return }
                 await MainActor.run {
-                    self.show(original: selection, phonetic: nil, translated: answer, isWord: false, senses: nil, llmUsed: true, anchor: anchor)
+                    self.show(
+                        original: selection,
+                        phonetic: nil,
+                        translated: answer,
+                        isWord: false,
+                        senses: nil,
+                        llmUsed: true,
+                        anchor: anchor,
+                        speechPreference: .translated
+                    )
+                    self.speakText(answer)
                 }
             } catch {
                 if Task.isCancelled { return }
                 await MainActor.run {
-                    self.show(original: selection, phonetic: nil, translated: "Failed: \(error)", isWord: false, senses: nil, llmUsed: true, anchor: anchor)
+                    self.show(
+                        original: selection,
+                        phonetic: nil,
+                        translated: "Failed: \(error)",
+                        isWord: false,
+                        senses: nil,
+                        llmUsed: true,
+                        anchor: anchor,
+                        speechPreference: .translated
+                    )
+                }
+            }
+        }
+    }
+
+    private func readSelectionDirectFromAskPanel() {
+        let selection = pendingAskSelection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selection.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        let anchor = askAnchorPoint == .zero ? NSEvent.mouseLocation : askAnchorPoint
+        let prev = askPreviousApp
+        hideAskPanel(restoreFocus: false)
+        prev?.activate(options: [])
+
+        show(
+            original: selection,
+            phonetic: nil,
+            translated: "Reading…",
+            isWord: false,
+            senses: nil,
+            llmUsed: false,
+            anchor: anchor,
+            speechPreference: .original
+        )
+        speakText(selection)
+    }
+
+    private func readSelectionSmartFromAskPanel() {
+        let selection = pendingAskSelection.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !selection.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        guard isLLMReady() else {
+            show(
+                original: "Smart Read unavailable",
+                phonetic: nil,
+                translated: "LLM is not configured. Open Settings… and set endpoint/model/apiKey first.",
+                isWord: false,
+                senses: nil,
+                llmUsed: false,
+                anchor: askAnchorPoint,
+                speechPreference: .translated
+            )
+            return
+        }
+
+        let anchor = askAnchorPoint == .zero ? NSEvent.mouseLocation : askAnchorPoint
+        let prev = askPreviousApp
+        hideAskPanel(restoreFocus: false)
+        prev?.activate(options: [])
+
+        show(
+            original: selection,
+            phonetic: nil,
+            translated: "Smart reading…",
+            isWord: false,
+            senses: nil,
+            llmUsed: nil,
+            anchor: anchor,
+            speechPreference: .translated
+        )
+
+        currentTask?.cancel()
+        currentTask = Task { [weak self] in
+            guard let self else { return }
+            let mode: LLMClient.SmartReadMode = self.seemsLikeCode(selection) ? .codeExplain : .cleanSummary
+            let llmSendLimit = max(8_000, AppConfig.shared.quickTranslateMaxSelectionChars)
+            let (excerpt, didTruncate) = self.makeLLMExcerpt(selection, maxChars: llmSendLimit)
+            do {
+                let result = try await self.llm.smartRead(selection: excerpt, mode: mode, didTruncate: didTruncate)
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.show(
+                        original: selection,
+                        phonetic: nil,
+                        translated: result,
+                        isWord: false,
+                        senses: nil,
+                        llmUsed: true,
+                        anchor: anchor,
+                        speechPreference: .translated
+                    )
+                    self.speakText(result)
+                }
+            } catch {
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.show(
+                        original: selection,
+                        phonetic: nil,
+                        translated: "Failed: \(error)",
+                        isWord: false,
+                        senses: nil,
+                        llmUsed: true,
+                        anchor: anchor,
+                        speechPreference: .translated
+                    )
                 }
             }
         }
@@ -725,9 +896,30 @@ final class QuickTranslateController {
 
         askKeyLocalMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown]) { [weak self] event in
             guard let self else { return event }
+            if event.window !== self.askPanel { return event }
+
             if event.keyCode == 53 { // esc
+                _ = self.speechSynth.stopSpeaking(at: .immediate)
                 self.hideAskPanel(restoreFocus: true)
                 return nil
+            }
+            if let chars = event.charactersIgnoringModifiers?.lowercased() {
+                if chars == "1" {
+                    self.readSelectionDirectFromAskPanel()
+                    return nil
+                }
+                if chars == "2" {
+                    self.readSelectionSmartFromAskPanel()
+                    return nil
+                }
+                if (chars == "r" || chars == "s"), self.askView.isPromptEmpty() {
+                    if chars == "r" {
+                        self.readSelectionDirectFromAskPanel()
+                    } else {
+                        self.readSelectionSmartFromAskPanel()
+                    }
+                    return nil
+                }
             }
             return event
         }
@@ -754,22 +946,143 @@ final class QuickTranslateController {
         if original.isEmpty, translated.isEmpty { return }
 
         let textToRead: String
-        if containsCJK(original), !translated.isEmpty, !containsCJK(translated) {
-            textToRead = translated
-        } else {
+        switch currentSpeechPreference {
+        case .translated:
+            textToRead = translated.isEmpty ? original : translated
+        case .original:
             textToRead = original.isEmpty ? translated : original
+        case .auto:
+            if seemsLikeCode(original), !translated.isEmpty {
+                textToRead = translated
+            } else if containsCJK(original), !translated.isEmpty, !containsCJK(translated) {
+                textToRead = translated
+            } else {
+                textToRead = original.isEmpty ? translated : original
+            }
         }
-        if textToRead.isEmpty { return }
+
+        speakText(textToRead)
+    }
+
+    private func speakText(_ raw: String) {
+        let text = normalizeSpeechText(raw)
+        if text.isEmpty { return }
 
         if speechSynth.isSpeaking {
             _ = speechSynth.stopSpeaking(at: .immediate)
         }
-        let utterance = AVSpeechUtterance(string: textToRead)
-        utterance.rate = AVSpeechUtteranceDefaultSpeechRate
-        if let voice = bestVoice(for: textToRead) {
-            utterance.voice = voice
+
+        let chunks = splitForSpeech(text)
+        for chunk in chunks {
+            let utterance = AVSpeechUtterance(string: chunk)
+            utterance.rate = AVSpeechUtteranceDefaultSpeechRate
+            if let voice = bestVoice(for: chunk) {
+                utterance.voice = voice
+            }
+            speechSynth.speak(utterance)
         }
-        speechSynth.speak(utterance)
+    }
+
+    private func normalizeSpeechText(_ raw: String) -> String {
+        var s = raw.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+
+        // Remove common markdown fences to reduce noisy speech.
+        s = s.replacingOccurrences(of: "```", with: "")
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func splitForSpeech(_ text: String) -> [String] {
+        let maxChunk = 900
+        let normalized = text.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+        let paragraphs = normalized.components(separatedBy: "\n\n")
+
+        var rough: [String] = []
+        var buffer = ""
+
+        func flush() {
+            let t = buffer.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { rough.append(t) }
+            buffer = ""
+        }
+
+        for p in paragraphs {
+            let para = p.trimmingCharacters(in: .whitespacesAndNewlines)
+            if para.isEmpty { continue }
+            if buffer.isEmpty {
+                buffer = para
+            } else if buffer.count + 2 + para.count <= maxChunk {
+                buffer += "\n\n" + para
+            } else {
+                flush()
+                buffer = para
+            }
+        }
+        flush()
+
+        var final: [String] = []
+        for c in rough {
+            if c.count <= maxChunk {
+                final.append(c)
+                continue
+            }
+
+            var current = ""
+            for ch in c {
+                current.append(ch)
+                if current.count >= maxChunk || "。！？.!?".contains(ch) {
+                    let t = current.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if !t.isEmpty { final.append(t) }
+                    current = ""
+                }
+            }
+            let t = current.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !t.isEmpty { final.append(t) }
+        }
+
+        return final.isEmpty ? rough : final
+    }
+
+    private func seemsLikeCode(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty { return false }
+        if t.contains("```") { return true }
+
+        let lower = t.lowercased()
+        let codeHints = ["func ", "class ", "struct ", "enum ", "let ", "var ", "import ", "public ", "private ", "return ", "if ", "else ", "for ", "while "]
+        if codeHints.contains(where: { lower.contains($0) }) { return true }
+
+        let symbols = "{}();[]=<>"
+        let symbolCount = t.filter { symbols.contains($0) }.count
+        let letterCount = t.unicodeScalars.filter { CharacterSet.letters.contains($0) }.count
+        if symbolCount >= 80 && Double(symbolCount) / Double(max(1, letterCount)) > 0.22 { return true }
+
+        // Many short lines that look like code.
+        let lines = t.split(separator: "\n")
+        if lines.count >= 8 {
+            let codeLineCount = lines.filter { line in
+                let s = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                if s.isEmpty { return false }
+                if s.hasPrefix("//") || s.hasPrefix("#") { return true }
+                if s.contains("{") || s.contains("}") || s.hasSuffix(";") { return true }
+                if s.contains("->") || s.contains("=>") { return true }
+                return false
+            }.count
+            if Double(codeLineCount) / Double(lines.count) >= 0.45 { return true }
+        }
+
+        return false
+    }
+
+    private func makeLLMExcerpt(_ text: String, maxChars: Int) -> (String, Bool) {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.count <= maxChars { return (t, false) }
+        let headCount = max(400, maxChars / 2)
+        let tailCount = max(400, maxChars - headCount)
+        let head = String(t.prefix(headCount))
+        let tail = String(t.suffix(tailCount))
+        return (head + "\n\n...[TRUNCATED]...\n\n" + tail, true)
     }
 
     private func bestVoice(for text: String) -> AVSpeechSynthesisVoice? {
@@ -823,6 +1136,22 @@ final class QuickTranslateController {
         }
         if let s = fetchSelectedTextViaCopyPreservingClipboard(maxWaitSeconds: quickTranslateCopyWaitSeconds + 1.6) {
             let t = normalizeText(s)
+            return t.isEmpty ? nil : t
+        }
+        return nil
+    }
+
+    private func fetchSelectedTextForAsk() -> String? {
+        if let s = fetchSelectedTextViaAccessibility() {
+            let t = normalizeTextPreservingNewlines(s)
+            return t.isEmpty ? nil : t
+        }
+        if let s = fetchSelectedTextViaCopyPreservingClipboard(maxWaitSeconds: quickTranslateCopyWaitSeconds) {
+            let t = normalizeTextPreservingNewlines(s)
+            return t.isEmpty ? nil : t
+        }
+        if let s = fetchSelectedTextViaCopyPreservingClipboard(maxWaitSeconds: quickTranslateCopyWaitSeconds + 1.6) {
+            let t = normalizeTextPreservingNewlines(s)
             return t.isEmpty ? nil : t
         }
         return nil
@@ -1108,6 +1437,14 @@ final class QuickTranslateController {
         return trimmed.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
     }
 
+    private func normalizeTextPreservingNewlines(_ text: String) -> String {
+        var s = text.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
+        s = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if s.isEmpty { return "" }
+        s = s.replacingOccurrences(of: "\\n{3,}", with: "\n\n", options: .regularExpression)
+        return s
+    }
+
     private func normalizeSelectionForLookup(_ text: String) -> String {
         let normalized = normalizeText(text)
         if normalized.isEmpty { return "" }
@@ -1336,6 +1673,8 @@ final class QuickTranslateController {
 final class QuickAskView: NSView {
     private let card = NSView()
     private let titleLabel = NSTextField(labelWithString: "Ask")
+    private let readButton = NSButton(title: "Read", target: nil, action: nil)
+    private let smartReadButton = NSButton(title: "Smart Read", target: nil, action: nil)
     private let selectionLabel = NSTextField(labelWithString: "")
     private let promptField = NSTextField(string: "")
     private let hintLabel = NSTextField(labelWithString: "")
@@ -1344,6 +1683,8 @@ final class QuickAskView: NSView {
 
     var onSubmit: ((String) -> Void)?
     var onCancel: (() -> Void)?
+    var onReadDirect: (() -> Void)?
+    var onReadSmart: (() -> Void)?
 
     private func applyCardColors() {
         effectiveAppearance.performAsCurrentDrawingAppearance {
@@ -1367,6 +1708,16 @@ final class QuickAskView: NSView {
         titleLabel.textColor = .secondaryLabelColor
         titleLabel.maximumNumberOfLines = 1
 
+        readButton.bezelStyle = .inline
+        readButton.controlSize = .small
+        readButton.target = self
+        readButton.action = #selector(onReadClicked)
+
+        smartReadButton.bezelStyle = .inline
+        smartReadButton.controlSize = .small
+        smartReadButton.target = self
+        smartReadButton.action = #selector(onSmartReadClicked)
+
         selectionLabel.font = NSFont.systemFont(ofSize: 12, weight: .regular)
         selectionLabel.textColor = .secondaryLabelColor
         selectionLabel.lineBreakMode = .byWordWrapping
@@ -1380,7 +1731,7 @@ final class QuickAskView: NSView {
         hintLabel.font = NSFont.systemFont(ofSize: 11, weight: .regular)
         hintLabel.textColor = .tertiaryLabelColor
         hintLabel.maximumNumberOfLines = 1
-        hintLabel.stringValue = "Enter to send · Esc to cancel"
+        hintLabel.stringValue = "1/R: Read · 2/S: Smart Read · Enter: Ask · Esc: close"
 
         cancelButton.bezelStyle = .inline
         cancelButton.controlSize = .small
@@ -1392,6 +1743,15 @@ final class QuickAskView: NSView {
         sendButton.target = self
         sendButton.action = #selector(onSendTriggered)
 
+        let topSpacer = NSView()
+        topSpacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        topSpacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let topRow = NSStackView(views: [titleLabel, topSpacer, readButton, smartReadButton])
+        topRow.orientation = .horizontal
+        topRow.alignment = .centerY
+        topRow.distribution = .fill
+        topRow.spacing = 10
+
         let spacer = NSView()
         spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
         spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
@@ -1401,7 +1761,7 @@ final class QuickAskView: NSView {
         bottomRow.distribution = .fill
         bottomRow.spacing = 10
 
-        let stack = NSStackView(views: [titleLabel, selectionLabel, promptField, bottomRow])
+        let stack = NSStackView(views: [topRow, selectionLabel, promptField, bottomRow])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.distribution = .fill
@@ -1443,6 +1803,10 @@ final class QuickAskView: NSView {
         window?.makeFirstResponder(promptField)
     }
 
+    func isPromptEmpty() -> Bool {
+        promptField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     func preferredSize(maxWidth: CGFloat) -> NSSize {
         let targetWidth = max(1, min(maxWidth, 560))
         return NSSize(width: ceil(targetWidth), height: 156)
@@ -1464,6 +1828,14 @@ final class QuickAskView: NSView {
 
     @objc private func onSendTriggered() {
         onSubmit?(promptField.stringValue)
+    }
+
+    @objc private func onReadClicked() {
+        onReadDirect?()
+    }
+
+    @objc private func onSmartReadClicked() {
+        onReadSmart?()
     }
 }
 
