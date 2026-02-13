@@ -1845,6 +1845,7 @@ final class QuickTranslateView: NSView {
     private let phoneticLabel = NSTextField(string: "")
     private let translatedScroll = NSScrollView()
     private let translatedTextView = NSTextView()
+    private var translatedHeightConstraint: NSLayoutConstraint?
     private let detailsLabel = NSTextField(string: "")
     private let hintLabel = NSTextField(labelWithString: "")
     private let llmStatusLabel = NSTextField(labelWithString: "")
@@ -1898,13 +1899,15 @@ final class QuickTranslateView: NSView {
         translatedTextView.isSelectable = true
         translatedTextView.isRichText = false
         translatedTextView.drawsBackground = false
-        translatedTextView.textContainerInset = NSSize(width: 0, height: 0)
+        translatedTextView.textContainerInset = NSSize(width: 0, height: 2)
         translatedTextView.font = NSFont.systemFont(ofSize: 14, weight: .regular)
         translatedTextView.textColor = .labelColor
         translatedTextView.isVerticallyResizable = true
         translatedTextView.isHorizontallyResizable = false
+        translatedTextView.minSize = NSSize(width: 0, height: 0)
+        translatedTextView.maxSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
         translatedTextView.autoresizingMask = [.width]
-        translatedTextView.textContainer?.containerSize = NSSize(width: CGFloat.greatestFiniteMagnitude, height: CGFloat.greatestFiniteMagnitude)
+        translatedTextView.textContainer?.containerSize = NSSize(width: 520, height: CGFloat.greatestFiniteMagnitude)
         translatedTextView.textContainer?.widthTracksTextView = true
         translatedTextView.textContainer?.lineBreakMode = .byCharWrapping
         translatedTextView.textContainer?.lineFragmentPadding = 0
@@ -1960,7 +1963,7 @@ final class QuickTranslateView: NSView {
 
         let stack = NSStackView(views: [originalLabel, phoneticLabel, translatedScroll, detailsLabel, bottomRow])
         stack.orientation = .vertical
-        stack.alignment = .leading
+        stack.alignment = .width
         stack.distribution = .fill
         stack.spacing = 8
         stack.translatesAutoresizingMaskIntoConstraints = false
@@ -1980,6 +1983,11 @@ final class QuickTranslateView: NSView {
             stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
             stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
         ])
+
+        let heightC = translatedScroll.heightAnchor.constraint(equalToConstant: 22)
+        heightC.priority = .required
+        heightC.isActive = true
+        translatedHeightConstraint = heightC
     }
 
     required init?(coder: NSCoder) { nil }
@@ -1987,6 +1995,14 @@ final class QuickTranslateView: NSView {
     override func viewDidChangeEffectiveAppearance() {
         super.viewDidChangeEffectiveAppearance()
         applyCardColors()
+    }
+
+    override func layout() {
+        super.layout()
+        // Ensure line wrapping matches the current scroll view width.
+        let w = max(60, translatedScroll.contentSize.width)
+        translatedTextView.textContainer?.containerSize = NSSize(width: w, height: CGFloat.greatestFiniteMagnitude)
+        translatedTextView.textContainer?.widthTracksTextView = true
     }
 
     func render(original: String, phonetic: String?, translated: String, isWord: Bool, senses: [WordSense]?, llmUsed: Bool?) {
@@ -2219,7 +2235,8 @@ final class QuickTranslateView: NSView {
 
         let h1 = height(original, font: originalFont)
         let hPh = phonetic.isEmpty ? 0 : height(phonetic, font: phoneticFont)
-        let h2 = height(translated, font: translatedFont)
+        let translatedInsetsV: CGFloat = 4
+        let h2 = height(translated, font: translatedFont) + translatedInsetsV
         let hDetails = details.isEmpty ? 0 : height(details, font: detailsFont)
         let hBottom = height(hint, font: hintFont)
 
@@ -2233,8 +2250,11 @@ final class QuickTranslateView: NSView {
         let maxBubbleHeight: CGFloat = 420
         let fixedH = paddingV + h1 + hPh + hDetails + hBottom + totalSpacing
         let maxTranslatedVisible = max(0, maxBubbleHeight - fixedH)
-        let translatedVisible = min(h2, maxTranslatedVisible)
+        let minTranslatedVisible = ceil(NSLayoutManager().defaultLineHeight(for: translatedFont)) + translatedInsetsV
+        let translatedVisible = min(max(h2, minTranslatedVisible), maxTranslatedVisible)
         let totalH = fixedH + translatedVisible
+
+        translatedHeightConstraint?.constant = translatedVisible
 
         return NSSize(width: ceil(targetWidth), height: min(maxBubbleHeight, max(88, totalH)))
     }
